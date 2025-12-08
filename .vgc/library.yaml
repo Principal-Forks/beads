@@ -1,0 +1,117 @@
+version: "1.0.0"
+name: "Beads Architecture"
+
+nodeTypes:
+  CLI:
+    name: "CLI"
+    description: "Command-line interface for beads"
+    color: "#4CAF50"
+    sources:
+      - "cmd/bd/*.go"
+      - "beads.go"
+    
+  Database:
+    name: "Database"
+    description: "SQLite database for issue storage"
+    color: "#2196F3"
+    sources:
+      - "internal/beads/*.go"
+      - "internal/storage/*.go"
+    
+  JSONL:
+    name: "JSONL"
+    description: "JSON Lines file for git synchronization"
+    color: "#FF9800"
+    sources:
+      - ".beads/issues.jsonl"
+      - "internal/export/*.go"
+    
+  RPC:
+    name: "RPC"
+    description: "Remote procedure call system"
+    color: "#9C27B0"
+    sources:
+      - "internal/rpc/*.go"
+    
+  Daemon:
+    name: "Daemon"
+    description: "Background daemon for auto-sync"
+    color: "#F44336"
+    sources:
+      - "internal/daemon/*.go"
+      - "cmd/bd/*daemon*.go"
+    
+  Importer:
+    name: "Importer"
+    description: "Import system for external data"
+    color: "#00BCD4"
+    sources:
+      - "internal/importer/*.go"
+      - "cmd/bd/*import*.go"
+    
+  Exporter:
+    name: "Exporter"
+    description: "Export system for data output"
+    color: "#8BC34A"
+    sources:
+      - "internal/export/*.go"
+      - "cmd/bd/*export*.go"
+    
+  Config:
+    name: "Config"
+    description: "Configuration management"
+    color: "#795548"
+    sources:
+      - "internal/config/*.go"
+      - "internal/configfile/*.go"
+    
+  Validation:
+    name: "Validation"
+    description: "Data validation system"
+    color: "#607D8B"
+    sources:
+      - "internal/validation/*.go"
+      - "cmd/bd/*valid*.go"
+    
+  Git:
+    name: "Git"
+    description: "Git version control integration"
+    color: "#FF5722"
+    sources:
+      - "internal/git/*.go"
+      - "internal/syncbranch/*.go"
+    
+  MCP:
+    name: "MCP"
+    description: "Model Context Protocol server"
+    color: "#E91E63"
+    sources:
+      - "integrations/beads-mcp/**/*.py"
+    
+  AgentMail:
+    name: "AgentMail"
+    description: "Multi-agent coordination system"
+    color: "#3F51B5"
+    sources:
+      - "docs/AGENT_MAIL*.md"
+
+edgeTypes:
+  data_flow:
+    name: "data_flow"
+    description: "Data flows between components"
+    color: "#4CAF50"
+    
+  depends_on:
+    name: "depends_on"
+    description: "Component dependency"
+    color: "#2196F3"
+    
+  communicates:
+    name: "communicates"
+    description: "Communication between components"
+    color: "#9C27B0"
+    
+  syncs:
+    name: "syncs"
+    description: "Synchronization relationship"
+    color: "#FF9800"

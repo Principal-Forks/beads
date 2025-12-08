@@ -1,0 +1,360 @@
+{
+  "vv": {
+    "name": "Beads Architecture",
+    "version": "1.0.0",
+    "nodeTypes": {
+      "CLI": {
+        "color": "#4CAF50"
+      },
+      "Database": {
+        "color": "#2196F3"
+      },
+      "JSONL": {
+        "color": "#FF9800"
+      },
+      "RPC": {
+        "color": "#9C27B0"
+      },
+      "Daemon": {
+        "color": "#F44336"
+      },
+      "Importer": {
+        "color": "#00BCD4"
+      },
+      "Exporter": {
+        "color": "#8BC34A"
+      },
+      "Config": {
+        "color": "#795548"
+      },
+      "Validation": {
+        "color": "#607D8B"
+      },
+      "Git": {
+        "color": "#FF5722"
+      },
+      "MCP": {
+        "color": "#E91E63"
+      },
+      "AgentMail": {
+        "color": "#3F51B5"
+      }
+    },
+    "edgeTypes": {
+      "data_flow": {
+        "color": "#4CAF50"
+      },
+      "depends_on": {
+        "color": "#2196F3"
+      },
+      "communicates": {
+        "color": "#9C27B0"
+      },
+      "syncs": {
+        "color": "#FF9800"
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "cli",
+      "type": "group",
+      "x": 100,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "CLI",
+        "shape": "rectangle",
+        "color": "#4CAF50"
+      },
+      "label": "CLI"
+    },
+    {
+      "id": "database",
+      "type": "group",
+      "x": 400,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Database",
+        "shape": "rectangle",
+        "color": "#2196F3"
+      },
+      "label": "Database"
+    },
+    {
+      "id": "jsonl",
+      "type": "group",
+      "x": 700,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "JSONL",
+        "shape": "rectangle",
+        "color": "#FF9800"
+      },
+      "label": "JSONL"
+    },
+    {
+      "id": "rpc",
+      "type": "group",
+      "x": 400,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "RPC",
+        "shape": "rectangle",
+        "color": "#9C27B0"
+      },
+      "label": "RPC"
+    },
+    {
+      "id": "daemon",
+      "type": "group",
+      "x": 400,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Daemon",
+        "shape": "rectangle",
+        "color": "#F44336"
+      },
+      "label": "Daemon"
+    },
+    {
+      "id": "importer",
+      "type": "group",
+      "x": 100,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Importer",
+        "shape": "rectangle",
+        "color": "#00BCD4"
+      },
+      "label": "Importer"
+    },
+    {
+      "id": "exporter",
+      "type": "group",
+      "x": 700,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Exporter",
+        "shape": "rectangle",
+        "color": "#8BC34A"
+      },
+      "label": "Exporter"
+    },
+    {
+      "id": "config",
+      "type": "group",
+      "x": 100,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Config",
+        "shape": "rectangle",
+        "color": "#795548"
+      },
+      "label": "Config"
+    },
+    {
+      "id": "validation",
+      "type": "group",
+      "x": 700,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Validation",
+        "shape": "rectangle",
+        "color": "#607D8B"
+      },
+      "label": "Validation"
+    },
+    {
+      "id": "git",
+      "type": "group",
+      "x": 1000,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "Git",
+        "shape": "rectangle",
+        "color": "#FF5722"
+      },
+      "label": "Git"
+    },
+    {
+      "id": "mcp",
+      "type": "group",
+      "x": 100,
+      "y": 500,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "MCP",
+        "shape": "rectangle",
+        "color": "#E91E63"
+      },
+      "label": "MCP"
+    },
+    {
+      "id": "agentmail",
+      "type": "group",
+      "x": 400,
+      "y": 500,
+      "width": 120,
+      "height": 60,
+      "vv": {
+        "nodeType": "AgentMail",
+        "shape": "rectangle",
+        "color": "#3F51B5"
+      },
+      "label": "AgentMail"
+    }
+  ],
+  "edges": [
+    {
+      "id": "cli-db",
+      "type": "link",
+      "fromNode": "cli",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "db-jsonl",
+      "type": "link",
+      "fromNode": "database",
+      "toNode": "jsonl",
+      "vv": {
+        "edgeType": "syncs",
+        "color": "#FF9800"
+      }
+    },
+    {
+      "id": "jsonl-git",
+      "type": "link",
+      "fromNode": "jsonl",
+      "toNode": "git",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "cli-rpc",
+      "type": "link",
+      "fromNode": "cli",
+      "toNode": "rpc",
+      "vv": {
+        "edgeType": "communicates",
+        "color": "#9C27B0"
+      }
+    },
+    {
+      "id": "rpc-db",
+      "type": "link",
+      "fromNode": "rpc",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "daemon-db",
+      "type": "link",
+      "fromNode": "daemon",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "daemon-jsonl",
+      "type": "link",
+      "fromNode": "daemon",
+      "toNode": "jsonl",
+      "vv": {
+        "edgeType": "syncs",
+        "color": "#FF9800"
+      }
+    },
+    {
+      "id": "importer-db",
+      "type": "link",
+      "fromNode": "importer",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "exporter-db",
+      "type": "link",
+      "fromNode": "exporter",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "data_flow",
+        "color": "#4CAF50"
+      }
+    },
+    {
+      "id": "config-cli",
+      "type": "link",
+      "fromNode": "config",
+      "toNode": "cli",
+      "vv": {
+        "edgeType": "depends_on",
+        "color": "#2196F3"
+      }
+    },
+    {
+      "id": "validation-db",
+      "type": "link",
+      "fromNode": "validation",
+      "toNode": "database",
+      "vv": {
+        "edgeType": "depends_on",
+        "color": "#2196F3"
+      }
+    },
+    {
+      "id": "cli-mcp",
+      "type": "link",
+      "fromNode": "cli",
+      "toNode": "mcp",
+      "vv": {
+        "edgeType": "communicates",
+        "color": "#9C27B0"
+      }
+    },
+    {
+      "id": "agentmail-daemon",
+      "type": "link",
+      "fromNode": "agentmail",
+      "toNode": "daemon",
+      "vv": {
+        "edgeType": "communicates",
+        "color": "#9C27B0"
+      }
+    }
+  ]
+}

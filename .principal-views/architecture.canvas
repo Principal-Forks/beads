@@ -1,0 +1,232 @@
+{
+  "pv": {
+    "name": "Beads Architecture",
+    "version": "1.0.0"
+  },
+  "nodes": [
+    {
+      "id": "cli",
+      "type": "group",
+      "x": 100,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "color": "#4CAF50",
+      "pv": {
+        "nodeType": "CLI"
+      }
+    },
+    {
+      "id": "database",
+      "type": "group",
+      "x": 400,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "color": "#2196F3",
+      "pv": {
+        "nodeType": "Database"
+      }
+    },
+    {
+      "id": "jsonl",
+      "type": "group",
+      "x": 700,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "color": "#FF9800",
+      "pv": {
+        "nodeType": "JSONL"
+      }
+    },
+    {
+      "id": "rpc",
+      "type": "group",
+      "x": 400,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "color": "#9C27B0",
+      "pv": {
+        "nodeType": "RPC"
+      }
+    },
+    {
+      "id": "daemon",
+      "type": "group",
+      "x": 400,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "color": "#F44336",
+      "pv": {
+        "nodeType": "Daemon"
+      }
+    },
+    {
+      "id": "importer",
+      "type": "group",
+      "x": 100,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "color": "#00BCD4",
+      "pv": {
+        "nodeType": "Importer"
+      }
+    },
+    {
+      "id": "exporter",
+      "type": "group",
+      "x": 700,
+      "y": 350,
+      "width": 120,
+      "height": 60,
+      "color": "#8BC34A",
+      "pv": {
+        "nodeType": "Exporter"
+      }
+    },
+    {
+      "id": "config",
+      "type": "group",
+      "x": 100,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "color": "#795548",
+      "pv": {
+        "nodeType": "Config"
+      }
+    },
+    {
+      "id": "validation",
+      "type": "group",
+      "x": 700,
+      "y": 50,
+      "width": 120,
+      "height": 60,
+      "color": "#607D8B",
+      "pv": {
+        "nodeType": "Validation"
+      }
+    },
+    {
+      "id": "git",
+      "type": "group",
+      "x": 1000,
+      "y": 200,
+      "width": 120,
+      "height": 60,
+      "color": "#FF5722",
+      "pv": {
+        "nodeType": "Git"
+      }
+    },
+    {
+      "id": "mcp",
+      "type": "group",
+      "x": 100,
+      "y": 500,
+      "width": 120,
+      "height": 60,
+      "color": "#E91E63",
+      "pv": {
+        "nodeType": "MCP"
+      }
+    },
+    {
+      "id": "agentmail",
+      "type": "group",
+      "x": 400,
+      "y": 500,
+      "width": 120,
+      "height": 60,
+      "color": "#3F51B5",
+      "pv": {
+        "nodeType": "AgentMail"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "cli-db",
+      "fromNode": "cli",
+      "toNode": "database",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "db-jsonl",
+      "fromNode": "database",
+      "toNode": "jsonl",
+      "color": "#FF9800"
+    },
+    {
+      "id": "jsonl-git",
+      "fromNode": "jsonl",
+      "toNode": "git",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "cli-rpc",
+      "fromNode": "cli",
+      "toNode": "rpc",
+      "color": "#9C27B0"
+    },
+    {
+      "id": "rpc-db",
+      "fromNode": "rpc",
+      "toNode": "database",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "daemon-db",
+      "fromNode": "daemon",
+      "toNode": "database",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "daemon-jsonl",
+      "fromNode": "daemon",
+      "toNode": "jsonl",
+      "color": "#FF9800"
+    },
+    {
+      "id": "importer-db",
+      "fromNode": "importer",
+      "toNode": "database",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "exporter-db",
+      "fromNode": "exporter",
+      "toNode": "database",
+      "color": "#4CAF50"
+    },
+    {
+      "id": "config-cli",
+      "fromNode": "config",
+      "toNode": "cli",
+      "color": "#2196F3"
+    },
+    {
+      "id": "validation-db",
+      "fromNode": "validation",
+      "toNode": "database",
+      "color": "#2196F3"
+    },
+    {
+      "id": "cli-mcp",
+      "fromNode": "cli",
+      "toNode": "mcp",
+      "color": "#9C27B0"
+    },
+    {
+      "id": "agentmail-daemon",
+      "fromNode": "agentmail",
+      "toNode": "daemon",
+      "color": "#9C27B0"
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 version: "1.0.0"
 name: "Beads Architecture"
 
-nodeTypes:
+nodeComponents:
   CLI:
-    name: "CLI"
+    defaultLabel: "CLI"
     description: "Command-line interface for beads"
     color: "#4CAF50"
     sources:
@@ -11,7 +11,7 @@ nodeTypes:
       - "beads.go"
     
   Database:
-    name: "Database"
+    defaultLabel: "Database"
     description: "SQLite database for issue storage"
     color: "#2196F3"
     sources:
@@ -19,7 +19,7 @@ nodeTypes:
       - "internal/storage/*.go"
     
   JSONL:
-    name: "JSONL"
+    defaultLabel: "JSONL"
     description: "JSON Lines file for git synchronization"
     color: "#FF9800"
     sources:
@@ -27,14 +27,14 @@ nodeTypes:
       - "internal/export/*.go"
     
   RPC:
-    name: "RPC"
+    defaultLabel: "RPC"
     description: "Remote procedure call system"
     color: "#9C27B0"
     sources:
       - "internal/rpc/*.go"
     
   Daemon:
-    name: "Daemon"
+    defaultLabel: "Daemon"
     description: "Background daemon for auto-sync"
     color: "#F44336"
     sources:
@@ -42,7 +42,7 @@ nodeTypes:
       - "cmd/bd/*daemon*.go"
     
   Importer:
-    name: "Importer"
+    defaultLabel: "Importer"
     description: "Import system for external data"
     color: "#00BCD4"
     sources:
@@ -50,7 +50,7 @@ nodeTypes:
       - "cmd/bd/*import*.go"
     
   Exporter:
-    name: "Exporter"
+    defaultLabel: "Exporter"
     description: "Export system for data output"
     color: "#8BC34A"
     sources:
@@ -58,7 +58,7 @@ nodeTypes:
       - "cmd/bd/*export*.go"
     
   Config:
-    name: "Config"
+    defaultLabel: "Config"
     description: "Configuration management"
     color: "#795548"
     sources:
@@ -66,7 +66,7 @@ nodeTypes:
       - "internal/configfile/*.go"
     
   Validation:
-    name: "Validation"
+    defaultLabel: "Validation"
     description: "Data validation system"
     color: "#607D8B"
     sources:
@@ -74,7 +74,7 @@ nodeTypes:
       - "cmd/bd/*valid*.go"
     
   Git:
-    name: "Git"
+    defaultLabel: "Git"
     description: "Git version control integration"
     color: "#FF5722"
     sources:
@@ -82,36 +82,32 @@ nodeTypes:
       - "internal/syncbranch/*.go"
     
   MCP:
-    name: "MCP"
+    defaultLabel: "MCP"
     description: "Model Context Protocol server"
     color: "#E91E63"
     sources:
       - "integrations/beads-mcp/**/*.py"
     
   AgentMail:
-    name: "AgentMail"
+    defaultLabel: "AgentMail"
     description: "Multi-agent coordination system"
     color: "#3F51B5"
     sources:
       - "docs/AGENT_MAIL*.md"
 
-edgeTypes:
+edgeComponents:
   data_flow:
-    name: "data_flow"
     description: "Data flows between components"
     color: "#4CAF50"
     
   depends_on:
-    name: "depends_on"
     description: "Component dependency"
     color: "#2196F3"
     
   communicates:
-    name: "communicates"
     description: "Communication between components"
     color: "#9C27B0"
     
   syncs:
-    name: "syncs"
     description: "Synchronization relationship"
     color: "#FF9800"

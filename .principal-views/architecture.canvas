@@ -154,78 +154,104 @@
       "id": "cli-db",
       "fromNode": "cli",
       "toNode": "database",
+      "fromSide": "right",
+      "toSide": "left",
       "color": "#4CAF50"
     },
     {
       "id": "db-jsonl",
       "fromNode": "database",
       "toNode": "jsonl",
+      "fromSide": "right",
+      "toSide": "left",
       "color": "#FF9800"
     },
     {
       "id": "jsonl-git",
       "fromNode": "jsonl",
       "toNode": "git",
+      "fromSide": "right",
+      "toSide": "left",
       "color": "#4CAF50"
     },
     {
       "id": "cli-rpc",
       "fromNode": "cli",
       "toNode": "rpc",
+      "fromSide": "top",
+      "toSide": "left",
       "color": "#9C27B0"
     },
     {
       "id": "rpc-db",
       "fromNode": "rpc",
       "toNode": "database",
+      "fromSide": "bottom",
+      "toSide": "top",
       "color": "#4CAF50"
     },
     {
       "id": "daemon-db",
       "fromNode": "daemon",
       "toNode": "database",
+      "fromSide": "top",
+      "toSide": "bottom",
       "color": "#4CAF50"
     },
     {
       "id": "daemon-jsonl",
       "fromNode": "daemon",
       "toNode": "jsonl",
+      "fromSide": "right",
+      "toSide": "bottom",
       "color": "#FF9800"
     },
     {
       "id": "importer-db",
       "fromNode": "importer",
       "toNode": "database",
+      "fromSide": "right",
+      "toSide": "bottom",
       "color": "#4CAF50"
     },
     {
       "id": "exporter-db",
       "fromNode": "exporter",
       "toNode": "database",
+      "fromSide": "left",
+      "toSide": "bottom",
       "color": "#4CAF50"
     },
     {
       "id": "config-cli",
       "fromNode": "config",
       "toNode": "cli",
+      "fromSide": "bottom",
+      "toSide": "top",
       "color": "#2196F3"
     },
     {
       "id": "validation-db",
       "fromNode": "validation",
       "toNode": "database",
+      "fromSide": "bottom",
+      "toSide": "top",
       "color": "#2196F3"
     },
     {
       "id": "cli-mcp",
       "fromNode": "cli",
       "toNode": "mcp",
+      "fromSide": "bottom",
+      "toSide": "top",
       "color": "#9C27B0"
     },
     {
       "id": "agentmail-daemon",
       "fromNode": "agentmail",
       "toNode": "daemon",
+      "fromSide": "left",
+      "toSide": "bottom",
       "color": "#9C27B0"
     }
   ]

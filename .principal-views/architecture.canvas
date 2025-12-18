@@ -6,7 +6,7 @@
   "nodes": [
     {
       "id": "cli",
-      "type": "group",
+      "type": "CLI",
       "x": 100,
       "y": 200,
       "width": 120,
@@ -18,7 +18,7 @@
     },
     {
       "id": "database",
-      "type": "group",
+      "type": "Database",
       "x": 400,
       "y": 200,
       "width": 120,
@@ -30,7 +30,7 @@
     },
     {
       "id": "jsonl",
-      "type": "group",
+      "type": "JSONL",
       "x": 700,
       "y": 200,
       "width": 120,
@@ -42,7 +42,7 @@
     },
     {
       "id": "rpc",
-      "type": "group",
+      "type": "RPC",
       "x": 400,
       "y": 50,
       "width": 120,
@@ -54,7 +54,7 @@
     },
     {
       "id": "daemon",
-      "type": "group",
+      "type": "Daemon",
       "x": 400,
       "y": 350,
       "width": 120,
@@ -66,7 +66,7 @@
     },
     {
       "id": "importer",
-      "type": "group",
+      "type": "Importer",
       "x": 100,
       "y": 350,
       "width": 120,
@@ -78,7 +78,7 @@
     },
     {
       "id": "exporter",
-      "type": "group",
+      "type": "Exporter",
       "x": 700,
       "y": 350,
       "width": 120,
@@ -90,7 +90,7 @@
     },
     {
       "id": "config",
-      "type": "group",
+      "type": "Config",
       "x": 100,
       "y": 50,
       "width": 120,
@@ -102,7 +102,7 @@
     },
     {
       "id": "validation",
-      "type": "group",
+      "type": "Validation",
       "x": 700,
       "y": 50,
       "width": 120,
@@ -114,7 +114,7 @@
     },
     {
       "id": "git",
-      "type": "group",
+      "type": "Git",
       "x": 1000,
       "y": 200,
       "width": 120,
@@ -126,7 +126,7 @@
     },
     {
       "id": "mcp",
-      "type": "group",
+      "type": "MCP",
       "x": 100,
       "y": 500,
       "width": 120,
@@ -138,7 +138,7 @@
     },
     {
       "id": "agentmail",
-      "type": "group",
+      "type": "AgentMail",
       "x": 400,
       "y": 500,
       "width": 120,

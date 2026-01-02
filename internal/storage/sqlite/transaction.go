@@ -48,7 +48,7 @@ func (s *SQLiteStorage) RunInTransaction(ctx context.Context, fn func(tx storage
 	defer func() { _ = conn.Close() }()
 
 	// Start IMMEDIATE transaction to acquire write lock early.
-	// Use retry logic with exponential backoff to handle SQLITE_BUSY (bd-ola6)
+	// Use retry logic with exponential backoff to handle SQLITE_BUSY
 	if err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -91,10 +91,40 @@ func (s *SQLiteStorage) RunInTransaction(ctx context.Context, fn func(tx storage
 
 // CreateIssue creates a new issue within the transaction.
 func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
-	// Fetch custom statuses for validation (bd-1pj6)
+	// Fetch custom statuses for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
+	}
+
+	// Set timestamps first so defensive fixes can use them
+	now := time.Now()
+	if issue.CreatedAt.IsZero() {
+		issue.CreatedAt = now
+	}
+	if issue.UpdatedAt.IsZero() {
+		issue.UpdatedAt = now
+	}
+
+	// Defensive fix for closed_at invariant (GH#523): older versions of bd could
+	// close issues without setting closed_at. Fix by using max(created_at, updated_at) + 1s.
+	if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
+		maxTime := issue.CreatedAt
+		if issue.UpdatedAt.After(maxTime) {
+			maxTime = issue.UpdatedAt
+		}
+		closedAt := maxTime.Add(time.Second)
+		issue.ClosedAt = &closedAt
+	}
+
+	// Defensive fix for deleted_at invariant: tombstones must have deleted_at
+	if issue.Status == types.StatusTombstone && issue.DeletedAt == nil {
+		maxTime := issue.CreatedAt
+		if issue.UpdatedAt.After(maxTime) {
+			maxTime = issue.UpdatedAt
+		}
+		deletedAt := maxTime.Add(time.Second)
+		issue.DeletedAt = &deletedAt
 	}
 
 	// Validate issue before creating (with custom status support)
@@ -102,42 +132,45 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Set timestamps
-	now := time.Now()
-	issue.CreatedAt = now
-	issue.UpdatedAt = now
-
-	// Compute content hash (bd-95)
+	// Compute content hash
 	if issue.ContentHash == "" {
 		issue.ContentHash = issue.ComputeContentHash()
 	}
 
 	// Get prefix from config (needed for both ID generation and validation)
-	var prefix string
-	err = t.conn.QueryRowContext(ctx, `SELECT value FROM config WHERE key = ?`, "issue_prefix").Scan(&prefix)
-	if err == sql.ErrNoRows || prefix == "" {
-		// CRITICAL: Reject operation if issue_prefix config is missing (bd-166)
+	var configPrefix string
+	err = t.conn.QueryRowContext(ctx, `SELECT value FROM config WHERE key = ?`, "issue_prefix").Scan(&configPrefix)
+	if err == sql.ErrNoRows || configPrefix == "" {
+		// CRITICAL: Reject operation if issue_prefix config is missing
 		return fmt.Errorf("database not initialized: issue_prefix config is missing (run 'bd init --prefix <prefix>' first)")
 	} else if err != nil {
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
+	// Use IDPrefix override if set, combined with config prefix
+	// e.g., configPrefix="bd" + IDPrefix="wisp" → "bd-wisp"
+	prefix := configPrefix
+	if issue.IDPrefix != "" {
+		prefix = configPrefix + "-" + issue.IDPrefix
+	}
+
 	// Generate or validate ID
 	if issue.ID == "" {
-		// Generate hash-based ID with adaptive length based on database size (bd-ea2a13)
+		// Generate hash-based ID with adaptive length based on database size
 		generatedID, err := GenerateIssueID(ctx, t.conn, prefix, issue, actor)
 		if err != nil {
 			return fmt.Errorf("failed to generate issue ID: %w", err)
 		}
 		issue.ID = generatedID
 	} else {
-		// Validate that explicitly provided ID matches the configured prefix (bd-177)
+		// Validate that explicitly provided ID matches the configured prefix
 		if err := ValidateIssueIDPrefix(issue.ID, prefix); err != nil {
 			return fmt.Errorf("failed to validate issue ID prefix: %w", err)
 		}
 
 		// For hierarchical IDs (bd-a3f8e9.1), ensure parent exists
-		if strings.Contains(issue.ID, ".") {
+		// Use IsHierarchicalID to correctly handle prefixes with dots (GH#508)
+		if isHierarchical, parentID := IsHierarchicalID(issue.ID); isHierarchical {
 			// Try to resurrect entire parent chain if any parents are missing
 			resurrected, err := t.parent.tryResurrectParentChainWithConn(ctx, t.conn, issue.ID)
 			if err != nil {
@@ -145,8 +178,6 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 			}
 			if !resurrected {
 				// Parent(s) not found in JSONL history - cannot proceed
-				lastDot := strings.LastIndex(issue.ID, ".")
-				parentID := issue.ID[:lastDot]
 				return fmt.Errorf("parent issue %s does not exist and could not be resurrected from JSONL history", parentID)
 			}
 		}
@@ -176,7 +207,7 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 		return nil
 	}
 
-	// Fetch custom statuses for validation (bd-1pj6)
+	// Fetch custom statuses for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
@@ -185,11 +216,38 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 	// Validate and prepare all issues first (with custom status support)
 	now := time.Now()
 	for _, issue := range issues {
+		// Set timestamps first so defensive fixes can use them
+		if issue.CreatedAt.IsZero() {
+			issue.CreatedAt = now
+		}
+		if issue.UpdatedAt.IsZero() {
+			issue.UpdatedAt = now
+		}
+
+		// Defensive fix for closed_at invariant (GH#523): older versions of bd could
+		// close issues without setting closed_at. Fix by using max(created_at, updated_at) + 1s.
+		if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
+			maxTime := issue.CreatedAt
+			if issue.UpdatedAt.After(maxTime) {
+				maxTime = issue.UpdatedAt
+			}
+			closedAt := maxTime.Add(time.Second)
+			issue.ClosedAt = &closedAt
+		}
+
+		// Defensive fix for deleted_at invariant: tombstones must have deleted_at
+		if issue.Status == types.StatusTombstone && issue.DeletedAt == nil {
+			maxTime := issue.CreatedAt
+			if issue.UpdatedAt.After(maxTime) {
+				maxTime = issue.UpdatedAt
+			}
+			deletedAt := maxTime.Add(time.Second)
+			issue.DeletedAt = &deletedAt
+		}
+
 		if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
 			return fmt.Errorf("validation failed for issue: %w", err)
 		}
-		issue.CreatedAt = now
-		issue.UpdatedAt = now
 		if issue.ContentHash == "" {
 			issue.ContentHash = issue.ComputeContentHash()
 		}
@@ -252,9 +310,11 @@ func (t *sqliteTxStorage) GetIssue(ctx context.Context, id string) (*types.Issue
 	row := t.conn.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, updated_at, closed_at, external_ref,
+		       created_at, created_by, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type
+		       deleted_at, deleted_by, delete_reason, original_type,
+		       sender, ephemeral, pinned, is_template,
+		       await_type, await_id, timeout_ns, waiters
 		FROM issues
 		WHERE id = ?
 	`, id)
@@ -310,7 +370,7 @@ func (t *sqliteTxStorage) UpdateIssue(ctx context.Context, id string, updates ma
 		return fmt.Errorf("issue %s not found", id)
 	}
 
-	// Fetch custom statuses for validation (bd-1pj6)
+	// Fetch custom statuses for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
@@ -338,7 +398,7 @@ func (t *sqliteTxStorage) UpdateIssue(ctx context.Context, id string, updates ma
 	// Auto-manage closed_at when status changes
 	setClauses, args = manageClosedAt(oldIssue, updates, setClauses, args)
 
-	// Recompute content_hash if any content fields changed (bd-95)
+	// Recompute content_hash if any content fields changed
 	contentChanged := false
 	contentFields := []string{"title", "description", "design", "acceptance_criteria", "notes", "status", "priority", "issue_type", "assignee", "external_ref"}
 	for _, field := range contentFields {
@@ -389,7 +449,7 @@ func (t *sqliteTxStorage) UpdateIssue(ctx context.Context, id string, updates ma
 		return fmt.Errorf("failed to mark issue dirty: %w", err)
 	}
 
-	// Invalidate blocked issues cache if status changed (bd-1c4h)
+	// Invalidate blocked issues cache if status changed
 	// Status changes affect which issues are blocked (blockers must be open/in_progress/blocked)
 	if _, statusChanged := updates["status"]; statusChanged {
 		if err := t.parent.invalidateBlockedCache(ctx, t.conn); err != nil {
@@ -462,13 +522,15 @@ func applyUpdatesToIssue(issue *types.Issue, updates map[string]interface{}) {
 }
 
 // CloseIssue closes an issue within the transaction.
-func (t *sqliteTxStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
+// NOTE: close_reason is stored in both issues table and events table - see SQLiteStorage.CloseIssue.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (t *sqliteTxStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	now := time.Now()
 
 	result, err := t.conn.ExecContext(ctx, `
-		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?
+		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
 		WHERE id = ?
-	`, types.StatusClosed, now, now, id)
+	`, types.StatusClosed, now, now, reason, session, id)
 	if err != nil {
 		return fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -494,10 +556,82 @@ func (t *sqliteTxStorage) CloseIssue(ctx context.Context, id string, reason stri
 		return fmt.Errorf("failed to mark issue dirty: %w", err)
 	}
 
-	// Invalidate blocked issues cache since status changed to closed (bd-1c4h)
+	// Invalidate blocked issues cache since status changed to closed
 	// Closed issues don't block others, so this affects blocking calculations
 	if err := t.parent.invalidateBlockedCache(ctx, t.conn); err != nil {
 		return fmt.Errorf("failed to invalidate blocked cache: %w", err)
+	}
+
+	// Reactive convoy completion: check if any convoys tracking this issue should auto-close
+	// Find convoys that track this issue (convoy.issue_id tracks closed_issue.depends_on_id)
+	convoyRows, err := t.conn.QueryContext(ctx, `
+		SELECT DISTINCT d.issue_id
+		FROM dependencies d
+		JOIN issues i ON d.issue_id = i.id
+		WHERE d.depends_on_id = ?
+		  AND d.type = ?
+		  AND i.issue_type = ?
+		  AND i.status != ?
+	`, id, types.DepTracks, types.TypeConvoy, types.StatusClosed)
+	if err != nil {
+		return fmt.Errorf("failed to find tracking convoys: %w", err)
+	}
+	defer func() { _ = convoyRows.Close() }()
+
+	var convoyIDs []string
+	for convoyRows.Next() {
+		var convoyID string
+		if err := convoyRows.Scan(&convoyID); err != nil {
+			return fmt.Errorf("failed to scan convoy ID: %w", err)
+		}
+		convoyIDs = append(convoyIDs, convoyID)
+	}
+	if err := convoyRows.Err(); err != nil {
+		return fmt.Errorf("convoy rows iteration error: %w", err)
+	}
+
+	// For each convoy, check if all tracked issues are now closed
+	for _, convoyID := range convoyIDs {
+		// Count non-closed tracked issues for this convoy
+		var openCount int
+		err := t.conn.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM dependencies d
+			JOIN issues i ON d.depends_on_id = i.id
+			WHERE d.issue_id = ?
+			  AND d.type = ?
+			  AND i.status != ?
+			  AND i.status != ?
+		`, convoyID, types.DepTracks, types.StatusClosed, types.StatusTombstone).Scan(&openCount)
+		if err != nil {
+			return fmt.Errorf("failed to count open tracked issues for convoy %s: %w", convoyID, err)
+		}
+
+		// If all tracked issues are closed, auto-close the convoy
+		if openCount == 0 {
+			closeReason := "All tracked issues completed"
+			_, err := t.conn.ExecContext(ctx, `
+				UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?
+				WHERE id = ?
+			`, types.StatusClosed, now, now, closeReason, convoyID)
+			if err != nil {
+				return fmt.Errorf("failed to auto-close convoy %s: %w", convoyID, err)
+			}
+
+			// Record the close event
+			_, err = t.conn.ExecContext(ctx, `
+				INSERT INTO events (issue_id, event_type, actor, comment)
+				VALUES (?, ?, ?, ?)
+			`, convoyID, types.EventClosed, "system:convoy-completion", closeReason)
+			if err != nil {
+				return fmt.Errorf("failed to record convoy close event: %w", err)
+			}
+
+			// Mark convoy as dirty
+			if err := markDirty(ctx, t.conn, convoyID); err != nil {
+				return fmt.Errorf("failed to mark convoy dirty: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -544,10 +678,10 @@ func (t *sqliteTxStorage) DeleteIssue(ctx context.Context, id string) error {
 func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
 	// Validate dependency type
 	if !dep.Type.IsValid() {
-		return fmt.Errorf("invalid dependency type: %s (must be blocks, related, parent-child, or discovered-from)", dep.Type)
+		return fmt.Errorf("invalid dependency type: %q (must be non-empty string, max 50 chars)", dep.Type)
 	}
 
-	// Validate that both issues exist
+	// Validate that source issue exists
 	issueExists, err := t.GetIssue(ctx, dep.IssueID)
 	if err != nil {
 		return fmt.Errorf("failed to check issue %s: %w", dep.IssueID, err)
@@ -556,24 +690,31 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 		return fmt.Errorf("issue %s not found", dep.IssueID)
 	}
 
-	dependsOnExists, err := t.GetIssue(ctx, dep.DependsOnID)
-	if err != nil {
-		return fmt.Errorf("failed to check dependency %s: %w", dep.DependsOnID, err)
-	}
-	if dependsOnExists == nil {
-		return fmt.Errorf("dependency target %s not found", dep.DependsOnID)
-	}
+	// External refs (external:<project>:<capability>) don't need target validation
+	// They are resolved lazily at query time by CheckExternalDep
+	isExternalRef := strings.HasPrefix(dep.DependsOnID, "external:")
 
-	// Prevent self-dependency
-	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("issue cannot depend on itself")
-	}
+	var dependsOnExists *types.Issue
+	if !isExternalRef {
+		dependsOnExists, err = t.GetIssue(ctx, dep.DependsOnID)
+		if err != nil {
+			return fmt.Errorf("failed to check dependency %s: %w", dep.DependsOnID, err)
+		}
+		if dependsOnExists == nil {
+			return fmt.Errorf("dependency target %s not found", dep.DependsOnID)
+		}
 
-	// Validate parent-child dependency direction
-	if dep.Type == types.DepParentChild {
-		if issueExists.IssueType == types.TypeEpic && dependsOnExists.IssueType != types.TypeEpic {
-			return fmt.Errorf("invalid parent-child dependency: parent (%s) cannot depend on child (%s). Use: bd dep add %s %s --type parent-child",
-				dep.IssueID, dep.DependsOnID, dep.DependsOnID, dep.IssueID)
+		// Prevent self-dependency (only for local deps)
+		if dep.IssueID == dep.DependsOnID {
+			return fmt.Errorf("issue cannot depend on itself")
+		}
+
+		// Validate parent-child dependency direction (only for local deps)
+		if dep.Type == types.DepParentChild {
+			if issueExists.IssueType == types.TypeEpic && dependsOnExists.IssueType != types.TypeEpic {
+				return fmt.Errorf("invalid parent-child dependency: parent (%s) cannot depend on child (%s). Use: bd dep add %s %s --type parent-child",
+					dep.IssueID, dep.DependsOnID, dep.DependsOnID, dep.IssueID)
+			}
 		}
 	}
 
@@ -584,9 +725,11 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 		dep.CreatedBy = actor
 	}
 
-	// Cycle detection
-	var cycleExists bool
-	err = t.conn.QueryRowContext(ctx, `
+	// Cycle detection - skip for relates-to (inherently bidirectional)
+	// See dependencies.go for full rationale on cycle prevention
+	if dep.Type != types.DepRelatesTo {
+		var cycleExists bool
+		err = t.conn.QueryRowContext(ctx, `
 		WITH RECURSIVE paths AS (
 			SELECT
 				issue_id,
@@ -611,20 +754,21 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 		)
 	`, dep.DependsOnID, dep.IssueID).Scan(&cycleExists)
 
-	if err != nil {
-		return fmt.Errorf("failed to check for cycles: %w", err)
+		if err != nil {
+			return fmt.Errorf("failed to check for cycles: %w", err)
+		}
+
+		if cycleExists {
+			return fmt.Errorf("cannot add dependency: would create a cycle (%s → %s → ... → %s)",
+				dep.IssueID, dep.DependsOnID, dep.IssueID)
+		}
 	}
 
-	if cycleExists {
-		return fmt.Errorf("cannot add dependency: would create a cycle (%s → %s → ... → %s)",
-			dep.IssueID, dep.DependsOnID, dep.IssueID)
-	}
-
-	// Insert dependency
+	// Insert dependency (including metadata and thread_id for edge consolidation - Decision 004)
 	_, err = t.conn.ExecContext(ctx, `
-		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-		VALUES (?, ?, ?, ?, ?)
-	`, dep.IssueID, dep.DependsOnID, dep.Type, dep.CreatedAt, dep.CreatedBy)
+		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, dep.IssueID, dep.DependsOnID, dep.Type, dep.CreatedAt, dep.CreatedBy, dep.Metadata, dep.ThreadID)
 	if err != nil {
 		return fmt.Errorf("failed to add dependency: %w", err)
 	}
@@ -639,16 +783,18 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
-	// Mark both issues as dirty
+	// Mark issues as dirty - for external refs, only mark the source issue
 	if err := markDirty(ctx, t.conn, dep.IssueID); err != nil {
 		return fmt.Errorf("failed to mark issue dirty: %w", err)
 	}
-	if err := markDirty(ctx, t.conn, dep.DependsOnID); err != nil {
-		return fmt.Errorf("failed to mark depends-on issue dirty: %w", err)
+	if !isExternalRef {
+		if err := markDirty(ctx, t.conn, dep.DependsOnID); err != nil {
+			return fmt.Errorf("failed to mark depends-on issue dirty: %w", err)
+		}
 	}
 
-	// Invalidate blocked cache for blocking dependencies (bd-1c4h)
-	if dep.Type == types.DepBlocks || dep.Type == types.DepParentChild {
+	// Invalidate blocked cache for blocking dependencies
+	if dep.Type.AffectsReadyWork() {
 		if err := t.parent.invalidateBlockedCache(ctx, t.conn); err != nil {
 			return fmt.Errorf("failed to invalidate blocked cache: %w", err)
 		}
@@ -659,7 +805,7 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 
 // RemoveDependency removes a dependency within the transaction.
 func (t *sqliteTxStorage) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	// First, check what type of dependency is being removed (bd-1c4h)
+	// First, check what type of dependency is being removed
 	var depType types.DependencyType
 	err := t.conn.QueryRowContext(ctx, `
 		SELECT type FROM dependencies WHERE issue_id = ? AND depends_on_id = ?
@@ -668,7 +814,7 @@ func (t *sqliteTxStorage) RemoveDependency(ctx context.Context, issueID, depends
 	// Store whether cache needs invalidation before deletion
 	needsCacheInvalidation := false
 	if err == nil {
-		needsCacheInvalidation = (depType == types.DepBlocks || depType == types.DepParentChild)
+		needsCacheInvalidation = depType.AffectsReadyWork()
 	}
 
 	result, err := t.conn.ExecContext(ctx, `
@@ -704,7 +850,7 @@ func (t *sqliteTxStorage) RemoveDependency(ctx context.Context, issueID, depends
 		return fmt.Errorf("failed to mark depends-on issue dirty: %w", err)
 	}
 
-	// Invalidate blocked cache if this was a blocking dependency (bd-1c4h)
+	// Invalidate blocked cache if this was a blocking dependency
 	if needsCacheInvalidation {
 		if err := t.parent.invalidateBlockedCache(ctx, t.conn); err != nil {
 			return fmt.Errorf("failed to invalidate blocked cache: %w", err)
@@ -920,9 +1066,29 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 		whereClauses = append(whereClauses, "status = ?")
 		args = append(args, *filter.Status)
 	} else if !filter.IncludeTombstones {
-		// Exclude tombstones by default unless explicitly filtering for them (bd-1bu)
+		// Exclude tombstones by default unless explicitly filtering for them
 		whereClauses = append(whereClauses, "status != ?")
 		args = append(args, types.StatusTombstone)
+	}
+
+	// Status exclusion (for default non-closed behavior, GH#788)
+	if len(filter.ExcludeStatus) > 0 {
+		placeholders := make([]string, len(filter.ExcludeStatus))
+		for i, s := range filter.ExcludeStatus {
+			placeholders[i] = "?"
+			args = append(args, string(s))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(filter.ExcludeTypes) > 0 {
+		placeholders := make([]string, len(filter.ExcludeTypes))
+		for i, t := range filter.ExcludeTypes {
+			placeholders[i] = "?"
+			args = append(args, string(t))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
 	if filter.Priority != nil {
@@ -1015,6 +1181,30 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// Wisp filtering
+	if filter.Ephemeral != nil {
+		if *filter.Ephemeral {
+			whereClauses = append(whereClauses, "ephemeral = 1") // SQL column is still 'ephemeral'
+		} else {
+			whereClauses = append(whereClauses, "(ephemeral = 0 OR ephemeral IS NULL)")
+		}
+	}
+
+	// Pinned filtering
+	if filter.Pinned != nil {
+		if *filter.Pinned {
+			whereClauses = append(whereClauses, "pinned = 1")
+		} else {
+			whereClauses = append(whereClauses, "(pinned = 0 OR pinned IS NULL)")
+		}
+	}
+
+	// Parent filtering: filter children by parent issue
+	if filter.ParentID != nil {
+		whereClauses = append(whereClauses, "id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?)")
+		args = append(args, *filter.ParentID)
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
@@ -1030,9 +1220,11 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 	querySQL := fmt.Sprintf(`
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, updated_at, closed_at, external_ref,
+		       created_at, created_by, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
-		       deleted_at, deleted_by, delete_reason, original_type
+		       deleted_at, deleted_by, delete_reason, original_type,
+		       sender, ephemeral, pinned, is_template,
+		       await_type, await_id, timeout_ns, waiters
 		FROM issues
 		%s
 		ORDER BY priority ASC, created_at DESC
@@ -1068,18 +1260,32 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	var sourceRepo sql.NullString
 	var compactedAtCommit sql.NullString
 	var closeReason sql.NullString
-	var deletedAt sql.NullTime
+	var deletedAt sql.NullString // TEXT column, not DATETIME - must parse manually
 	var deletedBy sql.NullString
 	var deleteReason sql.NullString
 	var originalType sql.NullString
+	// Messaging fields
+	var sender sql.NullString
+	var wisp sql.NullInt64
+	// Pinned field
+	var pinned sql.NullInt64
+	// Template field
+	var isTemplate sql.NullInt64
+	// Gate fields
+	var awaitType sql.NullString
+	var awaitID sql.NullString
+	var timeoutNs sql.NullInt64
+	var waiters sql.NullString
 
 	err := row.Scan(
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRef,
+		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
+		&sender, &wisp, &pinned, &isTemplate,
+		&awaitType, &awaitID, &timeoutNs, &waiters,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan issue: %w", err)
@@ -1116,9 +1322,7 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	if closeReason.Valid {
 		issue.CloseReason = closeReason.String
 	}
-	if deletedAt.Valid {
-		issue.DeletedAt = &deletedAt.Time
-	}
+	issue.DeletedAt = parseNullableTimeString(deletedAt)
 	if deletedBy.Valid {
 		issue.DeletedBy = deletedBy.String
 	}
@@ -1127,6 +1331,34 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	}
 	if originalType.Valid {
 		issue.OriginalType = originalType.String
+	}
+	// Messaging fields
+	if sender.Valid {
+		issue.Sender = sender.String
+	}
+	if wisp.Valid && wisp.Int64 != 0 {
+		issue.Ephemeral = true
+	}
+	// Pinned field
+	if pinned.Valid && pinned.Int64 != 0 {
+		issue.Pinned = true
+	}
+	// Template field
+	if isTemplate.Valid && isTemplate.Int64 != 0 {
+		issue.IsTemplate = true
+	}
+	// Gate fields
+	if awaitType.Valid {
+		issue.AwaitType = awaitType.String
+	}
+	if awaitID.Valid {
+		issue.AwaitID = awaitID.String
+	}
+	if timeoutNs.Valid {
+		issue.Timeout = time.Duration(timeoutNs.Int64)
+	}
+	if waiters.Valid && waiters.String != "" {
+		issue.Waiters = parseJSONStringArray(waiters.String)
 	}
 
 	return &issue, nil

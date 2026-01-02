@@ -2,37 +2,34 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/compact"
-	"github.com/steveyegge/beads/internal/configfile"
-	"github.com/steveyegge/beads/internal/deletions"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
-	"github.com/steveyegge/beads/internal/types"
 )
 
 var (
-	compactDryRun   bool
-	compactTier     int
-	compactAll      bool
-	compactID       string
-	compactForce    bool
-	compactBatch    int
-	compactWorkers  int
-	compactStats    bool
-	compactAnalyze  bool
-	compactApply    bool
-	compactAuto     bool
-	compactSummary  string
-	compactActor    string
-	compactLimit    int
-	compactRetention int
+	compactDryRun          bool
+	compactTier            int
+	compactAll             bool
+	compactID              string
+	compactForce           bool
+	compactBatch           int
+	compactWorkers         int
+	compactStats           bool
+	compactAnalyze         bool
+	compactApply           bool
+	compactAuto            bool
+	compactPrune           bool
+	compactPurgeTombstones bool
+	compactSummary         string
+	compactActor           string
+	compactLimit           int
+	compactOlderThan       int
 )
 
 var compactCmd = &cobra.Command{
@@ -44,6 +41,7 @@ Compaction reduces database size by summarizing closed issues that are no longer
 actively referenced. This is permanent graceful decay - original content is discarded.
 
 Modes:
+  - Prune: Remove expired tombstones from issues.jsonl (no API key needed)
   - Analyze: Export candidates for agent review (no API key needed)
   - Apply: Accept agent-provided summary (no API key needed)
   - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY, legacy)
@@ -52,17 +50,26 @@ Tiers:
   - Tier 1: Semantic compression (30 days closed, 70% reduction)
   - Tier 2: Ultra compression (90 days closed, 95% reduction)
 
-Deletions Pruning:
-  All modes also prune old deletion records from deletions.jsonl to prevent
-  unbounded growth. Default retention is 3 days (configurable via --retention
-  or deletions_retention_days in metadata.json).
+Tombstone Cleanup:
+  Tombstones are soft-delete markers that prevent resurrection of deleted issues.
 
-Tombstone Pruning:
-  All modes also prune expired tombstones from issues.jsonl. Tombstones are
-  soft-delete markers that prevent resurrection of deleted issues. After the
-  TTL expires (default 30 days), tombstones are removed to save space.
+  --prune: Remove tombstones by AGE (default 30 days). Safe but may keep
+           tombstones that could be deleted.
+
+  --purge-tombstones: Remove tombstones by DEPENDENCY ANALYSIS. More aggressive -
+           removes any tombstone that no open issues depend on, regardless of age.
+           Also cleans stale deps from closed issues to tombstones.
 
 Examples:
+  # Age-based pruning
+  bd compact --prune                       # Remove tombstones older than 30 days
+  bd compact --prune --older-than 7        # Remove tombstones older than 7 days
+  bd compact --prune --dry-run             # Preview what would be pruned
+
+  # Dependency-aware purging (more aggressive)
+  bd compact --purge-tombstones --dry-run  # Preview what would be purged
+  bd compact --purge-tombstones            # Remove tombstones with no open deps
+
   # Agent-driven workflow (recommended)
   bd compact --analyze --json              # Get candidates with full content
   bd compact --apply --id bd-42 --summary summary.txt
@@ -75,9 +82,6 @@ Examples:
 
   # Statistics
   bd compact --stats                       # Show statistics
-
-  # Override retention period
-  bd compact --auto --all --retention=14   # Keep 14 days of deletions
 `,
 	Run: func(_ *cobra.Command, _ []string) {
 		// Compact modifies data unless --stats or --analyze or --dry-run
@@ -101,6 +105,18 @@ Examples:
 			return
 		}
 
+		// Handle prune mode (standalone tombstone pruning by age)
+		if compactPrune {
+			runCompactPrune()
+			return
+		}
+
+		// Handle purge-tombstones mode (dependency-aware tombstone cleanup)
+		if compactPurgeTombstones {
+			runCompactPurgeTombstones()
+			return
+		}
+
 		// Count active modes
 		activeModes := 0
 		if compactAnalyze {
@@ -115,11 +131,11 @@ Examples:
 
 		// Check for exactly one mode
 		if activeModes == 0 {
-			fmt.Fprintf(os.Stderr, "Error: must specify one mode: --analyze, --apply, or --auto\n")
+			fmt.Fprintf(os.Stderr, "Error: must specify one mode: --prune, --purge-tombstones, --analyze, --apply, or --auto\n")
 			os.Exit(1)
 		}
 		if activeModes > 1 {
-			fmt.Fprintf(os.Stderr, "Error: cannot use multiple modes together (--analyze, --apply, --auto are mutually exclusive)\n")
+			fmt.Fprintf(os.Stderr, "Error: cannot use multiple modes together (--prune, --purge-tombstones, --analyze, --apply, --auto are mutually exclusive)\n")
 			os.Exit(1)
 		}
 
@@ -309,11 +325,8 @@ func runCompactSingle(ctx context.Context, compactor *compact.Compactor, store *
 		float64(savingBytes)/float64(originalSize)*100)
 	fmt.Printf("  Time: %v\n", elapsed)
 
-	// Prune old deletion records
-	pruneDeletionsManifest()
-
-	// Prune expired tombstones (bd-okh)
-	if tombstonePruneResult, err := pruneExpiredTombstones(); err != nil {
+	// Prune expired tombstones
+	if tombstonePruneResult, err := pruneExpiredTombstones(0); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", err)
 	} else if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
 		fmt.Printf("\nTombstones pruned: %d expired (older than %d days)\n",
@@ -444,11 +457,8 @@ func runCompactAll(ctx context.Context, compactor *compact.Compactor, store *sql
 		fmt.Printf("  Saved: %d bytes (%.1f%%)\n", totalSaved, float64(totalSaved)/float64(totalOriginal)*100)
 	}
 
-	// Prune old deletion records
-	pruneDeletionsManifest()
-
-	// Prune expired tombstones (bd-okh)
-	if tombstonePruneResult, err := pruneExpiredTombstones(); err != nil {
+	// Prune expired tombstones
+	if tombstonePruneResult, err := pruneExpiredTombstones(0); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", err)
 	} else if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
 		fmt.Printf("\nTombstones pruned: %d expired (older than %d days)\n",
@@ -513,182 +523,6 @@ func runCompactStats(ctx context.Context, store *sqlite.SQLiteStorage) {
 	if tier2Size > 0 {
 		fmt.Printf("  Estimated savings: %d bytes (95%%)\n", tier2Size*95/100)
 	}
-}
-
-func progressBar(current, total int) string {
-	const width = 40
-	if total == 0 {
-		return "[" + string(make([]byte, width)) + "]"
-	}
-	filled := (current * width) / total
-	bar := ""
-	for i := 0; i < width; i++ {
-		if i < filled {
-			bar += "█"
-		} else {
-			bar += " "
-		}
-	}
-	return "[" + bar + "]"
-}
-
-//nolint:unparam // ctx may be used in future for cancellation
-func runCompactRPC(_ context.Context) {
-	if compactID != "" && compactAll {
-		fmt.Fprintf(os.Stderr, "Error: cannot use --id and --all together\n")
-		os.Exit(1)
-	}
-
-	if compactForce && compactID == "" {
-		fmt.Fprintf(os.Stderr, "Error: --force requires --id\n")
-		os.Exit(1)
-	}
-
-	if compactID == "" && !compactAll && !compactDryRun {
-		fmt.Fprintf(os.Stderr, "Error: must specify --all, --id, or --dry-run\n")
-		os.Exit(1)
-	}
-
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" && !compactDryRun {
-		fmt.Fprintf(os.Stderr, "Error: ANTHROPIC_API_KEY environment variable not set\n")
-		os.Exit(1)
-	}
-
-	args := map[string]interface{}{
-		"tier":       compactTier,
-		"dry_run":    compactDryRun,
-		"force":      compactForce,
-		"all":        compactAll,
-		"api_key":    apiKey,
-		"workers":    compactWorkers,
-		"batch_size": compactBatch,
-	}
-	if compactID != "" {
-		args["issue_id"] = compactID
-	}
-
-	resp, err := daemonClient.Execute("compact", args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !resp.Success {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-		os.Exit(1)
-	}
-
-	if jsonOutput {
-		fmt.Println(string(resp.Data))
-		return
-	}
-
-	var result struct {
-		Success       bool   `json:"success"`
-		IssueID       string `json:"issue_id,omitempty"`
-		OriginalSize  int    `json:"original_size,omitempty"`
-		CompactedSize int    `json:"compacted_size,omitempty"`
-		Reduction     string `json:"reduction,omitempty"`
-		Duration      string `json:"duration,omitempty"`
-		DryRun        bool   `json:"dry_run,omitempty"`
-		Results       []struct {
-			IssueID       string `json:"issue_id"`
-			Success       bool   `json:"success"`
-			Error         string `json:"error,omitempty"`
-			OriginalSize  int    `json:"original_size,omitempty"`
-			CompactedSize int    `json:"compacted_size,omitempty"`
-			Reduction     string `json:"reduction,omitempty"`
-		} `json:"results,omitempty"`
-	}
-
-	if err := json.Unmarshal(resp.Data, &result); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-		os.Exit(1)
-	}
-
-	if compactID != "" {
-		if result.DryRun {
-			fmt.Printf("DRY RUN - Tier %d compaction\n\n", compactTier)
-			fmt.Printf("Issue: %s\n", compactID)
-			fmt.Printf("Original size: %d bytes\n", result.OriginalSize)
-			fmt.Printf("Estimated reduction: %s\n", result.Reduction)
-		} else {
-			fmt.Printf("Successfully compacted %s\n", result.IssueID)
-			fmt.Printf("Original size: %d bytes\n", result.OriginalSize)
-			fmt.Printf("Compacted size: %d bytes\n", result.CompactedSize)
-			fmt.Printf("Reduction: %s\n", result.Reduction)
-			fmt.Printf("Duration: %s\n", result.Duration)
-		}
-	} else if compactAll {
-		if result.DryRun {
-			fmt.Printf("DRY RUN - Found %d candidates for Tier %d compaction\n", len(result.Results), compactTier)
-		} else {
-			successCount := 0
-			for _, r := range result.Results {
-				if r.Success {
-					successCount++
-				}
-			}
-			fmt.Printf("Compacted %d/%d issues in %s\n", successCount, len(result.Results), result.Duration)
-			for _, r := range result.Results {
-				if r.Success {
-					fmt.Printf("  ✓ %s: %d → %d bytes (%s)\n", r.IssueID, r.OriginalSize, r.CompactedSize, r.Reduction)
-				} else {
-					fmt.Printf("  ✗ %s: %s\n", r.IssueID, r.Error)
-				}
-			}
-		}
-	}
-}
-
-func runCompactStatsRPC() {
-	args := map[string]interface{}{
-		"tier": compactTier,
-	}
-
-	resp, err := daemonClient.Execute("compact_stats", args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !resp.Success {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-		os.Exit(1)
-	}
-
-	if jsonOutput {
-		fmt.Println(string(resp.Data))
-		return
-	}
-
-	var result struct {
-		Success bool `json:"success"`
-		Stats   struct {
-			Tier1Candidates  int    `json:"tier1_candidates"`
-			Tier2Candidates  int    `json:"tier2_candidates"`
-			TotalClosed      int    `json:"total_closed"`
-			Tier1MinAge      string `json:"tier1_min_age"`
-			Tier2MinAge      string `json:"tier2_min_age"`
-			EstimatedSavings string `json:"estimated_savings,omitempty"`
-		} `json:"stats"`
-	}
-
-	if err := json.Unmarshal(resp.Data, &result); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("\nCompaction Statistics\n")
-	fmt.Printf("=====================\n\n")
-	fmt.Printf("Total closed issues: %d\n\n", result.Stats.TotalClosed)
-	fmt.Printf("Tier 1 (30+ days closed, not compacted):\n")
-	fmt.Printf("  Candidates: %d\n", result.Stats.Tier1Candidates)
-	fmt.Printf("  Min age: %s\n\n", result.Stats.Tier1MinAge)
-	fmt.Printf("Tier 2 (90+ days closed, Tier 1 compacted):\n")
-	fmt.Printf("  Candidates: %d\n", result.Stats.Tier2Candidates)
-	fmt.Printf("  Min age: %s\n", result.Stats.Tier2MinAge)
 }
 
 func runCompactAnalyze(ctx context.Context, store *sqlite.SQLiteStorage) {
@@ -890,11 +724,8 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 
 	elapsed := time.Since(start)
 
-	// Prune old deletion records (do this before JSON output so we can include results)
-	pruneResult, retentionDays := pruneDeletionsManifest()
-
-	// Prune expired tombstones from issues.jsonl (bd-okh)
-	tombstonePruneResult, tombstoneErr := pruneExpiredTombstones()
+	// Prune expired tombstones from issues.jsonl
+	tombstonePruneResult, tombstoneErr := pruneExpiredTombstones(0)
 	if tombstoneErr != nil && !jsonOutput {
 		fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", tombstoneErr)
 	}
@@ -910,14 +741,7 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 			"reduction_pct":  reductionPct,
 			"elapsed_ms":     elapsed.Milliseconds(),
 		}
-		// Include pruning results if any deletions were pruned (bd-v29)
-		if pruneResult != nil && pruneResult.PrunedCount > 0 {
-			output["deletions_pruned"] = map[string]interface{}{
-				"count":          pruneResult.PrunedCount,
-				"retention_days": retentionDays,
-			}
-		}
-		// Include tombstone pruning results (bd-okh)
+		// Include tombstone pruning results
 		if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
 			output["tombstones_pruned"] = map[string]interface{}{
 				"count":    tombstonePruneResult.PrunedCount,
@@ -932,12 +756,7 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 	fmt.Printf("  %d → %d bytes (saved %d, %.1f%%)\n", originalSize, compactedSize, savingBytes, reductionPct)
 	fmt.Printf("  Time: %v\n", elapsed)
 
-	// Report pruning results for human-readable output
-	if pruneResult != nil && pruneResult.PrunedCount > 0 {
-		fmt.Printf("\nDeletions pruned: %d records older than %d days removed\n", pruneResult.PrunedCount, retentionDays)
-	}
-
-	// Report tombstone pruning results (bd-okh)
+	// Report tombstone pruning results
 	if tombstonePruneResult != nil && tombstonePruneResult.PrunedCount > 0 {
 		fmt.Printf("\nTombstones pruned: %d expired tombstones (older than %d days) removed\n",
 			tombstonePruneResult.PrunedCount, tombstonePruneResult.TTLDays)
@@ -945,135 +764,6 @@ func runCompactApply(ctx context.Context, store *sqlite.SQLiteStorage) {
 
 	// Schedule auto-flush to export changes
 	markDirtyAndScheduleFlush()
-}
-
-// pruneDeletionsManifest prunes old deletion records based on retention settings.
-// Returns the prune result and retention days used, so callers can include in output.
-// Uses the global dbPath to determine the .beads directory.
-func pruneDeletionsManifest() (*deletions.PruneResult, int) {
-	beadsDir := filepath.Dir(dbPath)
-	// Determine retention days
-	retentionDays := compactRetention
-	if retentionDays <= 0 {
-		// Load config for default
-		cfg, err := configfile.Load(beadsDir)
-		if err != nil {
-			if !jsonOutput {
-				fmt.Fprintf(os.Stderr, "Warning: could not load config for retention settings: %v\n", err)
-			}
-			retentionDays = configfile.DefaultDeletionsRetentionDays
-		} else if cfg != nil {
-			retentionDays = cfg.GetDeletionsRetentionDays()
-		} else {
-			retentionDays = configfile.DefaultDeletionsRetentionDays
-		}
-	}
-
-	deletionsPath := deletions.DefaultPath(beadsDir)
-	result, err := deletions.PruneDeletions(deletionsPath, retentionDays)
-	if err != nil {
-		if !jsonOutput {
-			fmt.Fprintf(os.Stderr, "Warning: failed to prune deletions: %v\n", err)
-		}
-		return nil, retentionDays
-	}
-
-	return result, retentionDays
-}
-
-// TombstonePruneResult contains the results of tombstone pruning
-type TombstonePruneResult struct {
-	PrunedCount int
-	PrunedIDs   []string
-	TTLDays     int
-}
-
-// pruneExpiredTombstones reads issues.jsonl, removes expired tombstones,
-// and writes back the pruned file. Returns the prune result.
-func pruneExpiredTombstones() (*TombstonePruneResult, error) {
-	beadsDir := filepath.Dir(dbPath)
-	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	// Check if issues.jsonl exists
-	if _, err := os.Stat(issuesPath); os.IsNotExist(err) {
-		return &TombstonePruneResult{}, nil
-	}
-
-	// Read all issues
-	// nolint:gosec // G304: issuesPath is controlled from beadsDir
-	file, err := os.Open(issuesPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open issues.jsonl: %w", err)
-	}
-
-	var allIssues []*types.Issue
-	decoder := json.NewDecoder(file)
-	for {
-		var issue types.Issue
-		if err := decoder.Decode(&issue); err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
-			// Skip corrupt lines
-			continue
-		}
-		allIssues = append(allIssues, &issue)
-	}
-	file.Close()
-
-	// Determine TTL
-	ttl := types.DefaultTombstoneTTL
-	ttlDays := int(ttl.Hours() / 24)
-
-	// Filter out expired tombstones
-	var kept []*types.Issue
-	var prunedIDs []string
-	for _, issue := range allIssues {
-		if issue.IsExpired(ttl) {
-			prunedIDs = append(prunedIDs, issue.ID)
-		} else {
-			kept = append(kept, issue)
-		}
-	}
-
-	if len(prunedIDs) == 0 {
-		return &TombstonePruneResult{TTLDays: ttlDays}, nil
-	}
-
-	// Write back the pruned file atomically
-	dir := filepath.Dir(issuesPath)
-	base := filepath.Base(issuesPath)
-	tempFile, err := os.CreateTemp(dir, base+".prune.*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-
-	encoder := json.NewEncoder(tempFile)
-	for _, issue := range kept {
-		if err := encoder.Encode(issue); err != nil {
-			tempFile.Close()
-			os.Remove(tempPath)
-			return nil, fmt.Errorf("failed to write issue %s: %w", issue.ID, err)
-		}
-	}
-
-	if err := tempFile.Close(); err != nil {
-		os.Remove(tempPath)
-		return nil, fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Atomically replace
-	if err := os.Rename(tempPath, issuesPath); err != nil {
-		os.Remove(tempPath)
-		return nil, fmt.Errorf("failed to replace issues.jsonl: %w", err)
-	}
-
-	return &TombstonePruneResult{
-		PrunedCount: len(prunedIDs),
-		PrunedIDs:   prunedIDs,
-		TTLDays:     ttlDays,
-	}, nil
 }
 
 func init() {
@@ -1091,12 +781,12 @@ func init() {
 	compactCmd.Flags().BoolVar(&compactAnalyze, "analyze", false, "Analyze mode: export candidates for agent review")
 	compactCmd.Flags().BoolVar(&compactApply, "apply", false, "Apply mode: accept agent-provided summary")
 	compactCmd.Flags().BoolVar(&compactAuto, "auto", false, "Auto mode: AI-powered compaction (legacy)")
+	compactCmd.Flags().BoolVar(&compactPrune, "prune", false, "Prune mode: remove expired tombstones from issues.jsonl (by age)")
+	compactCmd.Flags().IntVar(&compactOlderThan, "older-than", -1, "Prune tombstones older than N days (0=all, default: 30)")
+	compactCmd.Flags().BoolVar(&compactPurgeTombstones, "purge-tombstones", false, "Purge mode: remove tombstones with no open deps (by dependency analysis)")
 	compactCmd.Flags().StringVar(&compactSummary, "summary", "", "Path to summary file (use '-' for stdin)")
 	compactCmd.Flags().StringVar(&compactActor, "actor", "agent", "Actor name for audit trail")
 	compactCmd.Flags().IntVar(&compactLimit, "limit", 0, "Limit number of candidates (0 = no limit)")
 
-	// Deletions pruning flag
-	compactCmd.Flags().IntVar(&compactRetention, "retention", 0, "Deletion retention days (0 = use config default)")
-
-	rootCmd.AddCommand(compactCmd)
+	// Note: compactCmd is added to adminCmd in admin.go
 }

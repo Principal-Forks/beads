@@ -2,12 +2,18 @@ package syncbranch
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"regexp"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
+
+	// Import SQLite driver (same as used by storage/sqlite)
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
 const (
@@ -54,6 +60,23 @@ func ValidateBranchName(name string) error {
 	// No leading/trailing slashes
 	if name[0] == '/' || name[len(name)-1] == '/' {
 		return fmt.Errorf("invalid branch name: cannot start or end with '/'")
+	}
+
+	return nil
+}
+
+// ValidateSyncBranchName checks if a branch name is valid for use as sync.branch.
+// GH#807: Setting sync.branch to 'main' or 'master' causes problems because the
+// worktree mechanism will check out that branch, preventing the user from checking
+// it out in their working directory.
+func ValidateSyncBranchName(name string) error {
+	if err := ValidateBranchName(name); err != nil {
+		return err
+	}
+
+	// GH#807: Reject main/master as sync branch - these cause worktree conflicts
+	if name == "main" || name == "master" {
+		return fmt.Errorf("cannot use '%s' as sync branch: git worktrees prevent checking out the same branch in multiple locations. Use a dedicated branch like 'beads-sync' instead", name)
 	}
 
 	return nil
@@ -114,9 +137,66 @@ func IsConfigured() bool {
 	return GetFromYAML() != ""
 }
 
+// IsConfiguredWithDB returns true if sync-branch is configured in any source:
+// 1. BEADS_SYNC_BRANCH environment variable
+// 2. sync-branch in config.yaml
+// 3. sync.branch in database config
+//
+// The dbPath parameter should be the path to the beads.db file.
+// If dbPath is empty, it will use beads.FindDatabasePath() to locate the database.
+// This function is safe to call even if the database doesn't exist (returns false in that case).
+func IsConfiguredWithDB(dbPath string) bool {
+	// First check env var and config.yaml (fast path)
+	if GetFromYAML() != "" {
+		return true
+	}
+
+	// Try to read from database
+	if dbPath == "" {
+		// Use existing beads.FindDatabasePath() which is worktree-aware
+		dbPath = beads.FindDatabasePath()
+		if dbPath == "" {
+			return false
+		}
+	}
+
+	// Read sync.branch from database config table
+	branch := getConfigFromDB(dbPath, ConfigKey)
+	return branch != ""
+}
+
+// getConfigFromDB reads a config value directly from the database file.
+// This is a lightweight read that doesn't require the full storage layer.
+// Returns empty string if the database doesn't exist or the key is not found.
+func getConfigFromDB(dbPath string, key string) string {
+	// Check if database exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return ""
+	}
+
+	// Open database in read-only mode
+	// Use file: prefix as required by ncruces/go-sqlite3 driver
+	connStr := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite3", connStr)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+
+	// Query the config table
+	var value string
+	err = db.QueryRow(`SELECT value FROM config WHERE key = ?`, key).Scan(&value)
+	if err != nil {
+		return ""
+	}
+
+	return value
+}
+
 // Set stores the sync branch configuration in the database
 func Set(ctx context.Context, store storage.Storage, branch string) error {
-	if err := ValidateBranchName(branch); err != nil {
+	// GH#807: Use sync-specific validation that rejects main/master
+	if err := ValidateSyncBranchName(branch); err != nil {
 		return err
 	}
 

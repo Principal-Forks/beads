@@ -8,7 +8,7 @@ This document contains detailed operational instructions for AI agents working o
 
 ### Code Standards
 
-- **Go version**: 1.21+
+- **Go version**: 1.24+
 - **Linting**: `golangci-lint run ./...` (baseline warnings documented in [docs/LINTING.md](docs/LINTING.md))
 - **Testing**: All new features need tests (`go test -short ./...` for local, full tests run in CI)
 - **Documentation**: Update relevant .md files
@@ -61,6 +61,17 @@ func TestMyFeature(t *testing.T) {
 3. **Update docs**: If you changed behavior, update README.md or other docs
 4. **Commit**: Issues auto-sync to `.beads/issues.jsonl` and import after pull
 
+### Commit Message Convention
+
+When committing work for an issue, include the issue ID in parentheses at the end:
+
+```bash
+git commit -m "Fix auth validation bug (bd-abc)"
+git commit -m "Add retry logic for database locks (bd-xyz)"
+```
+
+This enables `bd doctor` to detect **orphaned issues** - work that was committed but the issue wasn't closed. The doctor check cross-references open issues against git history to find these orphans.
+
 ### Git Workflow
 
 **Auto-sync provides batching!** bd automatically:
@@ -77,9 +88,9 @@ The 30-second debounce provides a **transaction window** for batch operations - 
 
 **Protected branches**: Use `bd init --branch beads-metadata` to commit to separate branch. See [docs/PROTECTED_BRANCHES.md](docs/PROTECTED_BRANCHES.md).
 
-**Git worktrees**: Daemon mode NOT supported. Use `bd --no-daemon` for all commands. See [docs/GIT_INTEGRATION.md](docs/GIT_INTEGRATION.md).
+**Git worktrees**: Enhanced support with shared database architecture. Use `bd --no-daemon` if daemon warnings appear. See [docs/GIT_INTEGRATION.md](docs/GIT_INTEGRATION.md).
 
-**Merge conflicts**: Rare with hash IDs. If conflicts occur, use `git checkout --theirs/.beads/beads.jsonl` and `bd import`. See [docs/GIT_INTEGRATION.md](docs/GIT_INTEGRATION.md).
+**Merge conflicts**: Rare with hash IDs. If conflicts occur, use `git checkout --theirs/.beads/issues.jsonl` and `bd import`. See [docs/GIT_INTEGRATION.md](docs/GIT_INTEGRATION.md).
 
 ## Landing the Plane
 
@@ -88,16 +99,19 @@ The 30-second debounce provides a **transaction window** for batch operations - 
 **MANDATORY WORKFLOW - COMPLETE ALL STEPS:**
 
 1. **File beads issues for any remaining work** that needs follow-up
-2. **Ensure all quality gates pass** (only if code changes were made) - run tests, linters, builds (file P0 issues if broken)
+2. **Ensure all quality gates pass** (only if code changes were made):
+   - Run `make lint` or `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
+   - Run `make test` or `go test ./...`
+   - File P0 issues if quality gates are broken
 3. **Update beads issues** - close finished work, update status
 4. **PUSH TO REMOTE - NON-NEGOTIABLE** - This step is MANDATORY. Execute ALL commands below:
    ```bash
    # Pull first to catch any remote changes
    git pull --rebase
 
-   # If conflicts in .beads/beads.jsonl, resolve thoughtfully:
-   #   - git checkout --theirs .beads/beads.jsonl (accept remote)
-   #   - bd import -i .beads/beads.jsonl (re-import)
+   # If conflicts in .beads/issues.jsonl, resolve thoughtfully:
+   #   - git checkout --theirs .beads/issues.jsonl (accept remote)
+   #   - bd import -i .beads/issues.jsonl (re-import)
    #   - Or manual merge, then import
 
    # Sync the database (exports to JSONL, commits)
@@ -145,9 +159,9 @@ bd close bd-42 bd-43 --reason "Completed" --json
 
 # 4. PUSH TO REMOTE - MANDATORY, NO STOPPING BEFORE THIS IS DONE
 git pull --rebase
-# If conflicts in .beads/beads.jsonl, resolve thoughtfully:
-#   - git checkout --theirs .beads/beads.jsonl (accept remote)
-#   - bd import -i .beads/beads.jsonl (re-import)
+# If conflicts in .beads/issues.jsonl, resolve thoughtfully:
+#   - git checkout --theirs .beads/issues.jsonl (accept remote)
+#   - bd import -i .beads/issues.jsonl (re-import)
 #   - Or manual merge, then import
 bd sync        # Export/import/commit
 git push       # MANDATORY - THE PLANE IS STILL IN THE AIR UNTIL THIS SUCCEEDS
@@ -232,6 +246,20 @@ Without the pre-push hook, you can have database changes committed locally but s
 **Note:** Hooks are embedded in the bd binary and work for all bd users (not just source repo users).
 
 ## Common Development Tasks
+
+### CLI Design Principles
+
+**Minimize cognitive overload.** Every new command, flag, or option adds cognitive burden for users. Before adding anything:
+
+1. **Recovery/fix operations → `bd doctor --fix`**: Don't create separate commands like `bd recover` or `bd repair`. Doctor already detects problems - let `--fix` handle remediation. This keeps all health-related operations in one discoverable place.
+
+2. **Prefer flags on existing commands**: Before creating a new command, ask: "Can this be a flag on an existing command?" Example: `bd list --stale` instead of `bd stale`.
+
+3. **Consolidate related operations**: Related operations should live together. Daemon management uses `bd daemons {list,health,killall}`, not separate top-level commands.
+
+4. **Count the commands**: Run `bd --help` and count. If we're approaching 30+ commands, we have a discoverability problem. Consider subcommand grouping.
+
+5. **New commands need strong justification**: A new command should represent a fundamentally different operation, not just a convenience wrapper.
 
 ### Adding a New Command
 

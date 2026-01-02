@@ -1,7 +1,10 @@
 package validation
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/types"
 )
 
 func TestParsePriority(t *testing.T) {
@@ -106,6 +109,68 @@ func TestValidateIDFormat(t *testing.T) {
 	}
 }
 
+func TestParseIssueType(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantType     types.IssueType
+		wantError    bool
+		errorContains string
+	}{
+		// Valid issue types
+		{"bug type", "bug", types.TypeBug, false, ""},
+		{"feature type", "feature", types.TypeFeature, false, ""},
+		{"task type", "task", types.TypeTask, false, ""},
+		{"epic type", "epic", types.TypeEpic, false, ""},
+		{"chore type", "chore", types.TypeChore, false, ""},
+		{"merge-request type", "merge-request", types.TypeMergeRequest, false, ""},
+		{"molecule type", "molecule", types.TypeMolecule, false, ""},
+		{"gate type", "gate", types.TypeGate, false, ""},
+		{"agent type", "agent", types.TypeAgent, false, ""},
+		{"role type", "role", types.TypeRole, false, ""},
+		{"message type", "message", types.TypeMessage, false, ""},
+
+		// Case sensitivity (function is case-sensitive)
+		{"uppercase bug", "BUG", types.TypeTask, true, "invalid issue type"},
+		{"mixed case feature", "FeAtUrE", types.TypeTask, true, "invalid issue type"},
+
+		// With whitespace
+		{"bug with spaces", "  bug  ", types.TypeBug, false, ""},
+		{"feature with tabs", "\tfeature\t", types.TypeFeature, false, ""},
+
+		// Invalid issue types
+		{"invalid type", "invalid", types.TypeTask, true, "invalid issue type"},
+		{"empty string", "", types.TypeTask, true, "invalid issue type"},
+		{"whitespace only", "   ", types.TypeTask, true, "invalid issue type"},
+		{"numeric type", "123", types.TypeTask, true, "invalid issue type"},
+		{"special chars", "bug!", types.TypeTask, true, "invalid issue type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseIssueType(tt.input)
+			
+			// Check error conditions
+			if (err != nil) != tt.wantError {
+				t.Errorf("ParseIssueType(%q) error = %v, wantError %v", tt.input, err, tt.wantError)
+				return
+			}
+			
+			if err != nil && tt.errorContains != "" {
+				if !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("ParseIssueType(%q) error message = %q, should contain %q", tt.input, err.Error(), tt.errorContains)
+				}
+				return
+			}
+			
+			// Check return value
+			if got != tt.wantType {
+				t.Errorf("ParseIssueType(%q) = %v, want %v", tt.input, got, tt.wantType)
+			}
+		})
+	}
+}
+
 func TestValidatePrefix(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -125,6 +190,76 @@ func TestValidatePrefix(t *testing.T) {
 			err := ValidatePrefix(tt.requestedPrefix, tt.dbPrefix, tt.force)
 			if (err != nil) != tt.wantError {
 				t.Errorf("ValidatePrefix() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidateAgentID(t *testing.T) {
+	tests := []struct {
+		name          string
+		id            string
+		wantError     bool
+		errorContains string
+	}{
+		// Town-level agents (no rig)
+		{"valid mayor", "gt-mayor", false, ""},
+		{"valid deacon", "gt-deacon", false, ""},
+
+		// Per-rig agents (canonical format: gt-<rig>-<role>)
+		{"valid witness gastown", "gt-gastown-witness", false, ""},
+		{"valid refinery beads", "gt-beads-refinery", false, ""},
+
+		// Named agents (canonical format: gt-<rig>-<role>-<name>)
+		{"valid polecat", "gt-gastown-polecat-nux", false, ""},
+		{"valid crew", "gt-beads-crew-dave", false, ""},
+		{"valid polecat with complex name", "gt-gastown-polecat-war-boy-1", false, ""},
+
+		// Valid: alternative prefixes (beads uses bd-)
+		{"valid bd-mayor", "bd-mayor", false, ""},
+		{"valid bd-beads-polecat-pearl", "bd-beads-polecat-pearl", false, ""},
+		{"valid bd-beads-witness", "bd-beads-witness", false, ""},
+
+		// Invalid: no prefix (missing hyphen)
+		{"no prefix", "mayor", true, "must have a prefix followed by '-'"},
+
+		// Invalid: empty
+		{"empty id", "", true, "agent ID is required"},
+
+		// Invalid: unknown role in position 2
+		{"unknown role", "gt-gastown-admin", true, "invalid agent format"},
+
+		// Invalid: town-level with rig (put role first)
+		{"mayor with rig suffix", "gt-gastown-mayor", true, "cannot have rig suffix"},
+		{"deacon with rig suffix", "gt-beads-deacon", true, "cannot have rig suffix"},
+
+		// Invalid: per-rig role without rig
+		{"witness alone", "gt-witness", true, "requires rig"},
+		{"refinery alone", "gt-refinery", true, "requires rig"},
+
+		// Invalid: named agent without name
+		{"crew no name", "gt-beads-crew", true, "requires name"},
+		{"polecat no name", "gt-gastown-polecat", true, "requires name"},
+
+		// Invalid: witness/refinery with extra parts
+		{"witness with name", "gt-gastown-witness-extra", true, "cannot have name suffix"},
+		{"refinery with name", "gt-beads-refinery-extra", true, "cannot have name suffix"},
+
+		// Invalid: empty components
+		{"empty after prefix", "gt-", true, "must include content after prefix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAgentID(tt.id)
+			if (err != nil) != tt.wantError {
+				t.Errorf("ValidateAgentID(%q) error = %v, wantError %v", tt.id, err, tt.wantError)
+				return
+			}
+			if err != nil && tt.errorContains != "" {
+				if !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("ValidateAgentID(%q) error = %q, should contain %q", tt.id, err.Error(), tt.errorContains)
+				}
 			}
 		})
 	}

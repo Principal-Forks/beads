@@ -30,16 +30,8 @@ func ParsePriority(content string) int {
 func ParseIssueType(content string) (types.IssueType, error) {
 	issueType := types.IssueType(strings.TrimSpace(content))
 
-	// Validate issue type
-	validTypes := map[types.IssueType]bool{
-		types.TypeBug:     true,
-		types.TypeFeature: true,
-		types.TypeTask:    true,
-		types.TypeEpic:    true,
-		types.TypeChore:   true,
-	}
-
-	if !validTypes[issueType] {
+	// Use the canonical IsValid() from types package
+	if !issueType.IsValid() {
 		return types.TypeTask, fmt.Errorf("invalid issue type: %s", content)
 	}
 
@@ -52,7 +44,7 @@ func ParseIssueType(content string) (types.IssueType, error) {
 func ValidatePriority(priorityStr string) (int, error) {
 	priority := ParsePriority(priorityStr)
 	if priority == -1 {
-		return -1, fmt.Errorf("invalid priority %q (expected 0-4 or P0-P4)", priorityStr)
+		return -1, fmt.Errorf("invalid priority %q (expected 0-4 or P0-P4, not words like high/medium/low)", priorityStr)
 	}
 	return priority, nil
 }
@@ -85,4 +77,154 @@ func ValidatePrefix(requestedPrefix, dbPrefix string, force bool) error {
 	}
 
 	return fmt.Errorf("prefix mismatch: database uses '%s' but you specified '%s' (use --force to override)", dbPrefix, requestedPrefix)
+}
+
+// ValidAgentRoles are the known agent role types for ID pattern validation
+var ValidAgentRoles = []string{
+	"mayor",    // Town-level: gt-mayor
+	"deacon",   // Town-level: gt-deacon
+	"witness",  // Per-rig: gt-<rig>-witness
+	"refinery", // Per-rig: gt-<rig>-refinery
+	"crew",     // Per-rig with name: gt-<rig>-crew-<name>
+	"polecat",  // Per-rig with name: gt-<rig>-polecat-<name>
+}
+
+// TownLevelRoles are agent roles that don't have a rig
+var TownLevelRoles = []string{"mayor", "deacon"}
+
+// RigLevelRoles are agent roles that have a rig but no name
+var RigLevelRoles = []string{"witness", "refinery"}
+
+// NamedRoles are agent roles that include a worker name
+var NamedRoles = []string{"crew", "polecat"}
+
+// isValidRole checks if a string is a valid agent role
+func isValidRole(s string) bool {
+	for _, r := range ValidAgentRoles {
+		if s == r {
+			return true
+		}
+	}
+	return false
+}
+
+// isTownLevelRole checks if a role is a town-level role (no rig)
+func isTownLevelRole(s string) bool {
+	for _, r := range TownLevelRoles {
+		if s == r {
+			return true
+		}
+	}
+	return false
+}
+
+// isRigLevelRole checks if a role is a rig-level singleton role
+func isRigLevelRole(s string) bool {
+	for _, r := range RigLevelRoles {
+		if s == r {
+			return true
+		}
+	}
+	return false
+}
+
+// isNamedRole checks if a role requires a worker name
+func isNamedRole(s string) bool {
+	for _, r := range NamedRoles {
+		if s == r {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateAgentID validates that an agent ID follows the expected pattern.
+// Canonical format: prefix-rig-role-name
+// Patterns:
+//   - Town-level: <prefix>-<role> (e.g., gt-mayor, bd-deacon)
+//   - Per-rig singleton: <prefix>-<rig>-<role> (e.g., gt-gastown-witness)
+//   - Per-rig named: <prefix>-<rig>-<role>-<name> (e.g., gt-gastown-polecat-nux)
+//
+// The prefix can be any rig's configured prefix (gt-, bd-, etc.).
+// Returns nil if the ID is valid, or an error describing the issue.
+func ValidateAgentID(id string) error {
+	if id == "" {
+		return fmt.Errorf("agent ID is required")
+	}
+
+	// Must contain a hyphen to have a prefix
+	hyphenIdx := strings.Index(id, "-")
+	if hyphenIdx <= 0 {
+		return fmt.Errorf("agent ID must have a prefix followed by '-' (got %q)", id)
+	}
+
+	// Split into parts after the prefix
+	rest := id[hyphenIdx+1:] // Skip "<prefix>-"
+	parts := strings.Split(rest, "-")
+	if len(parts) < 1 || parts[0] == "" {
+		return fmt.Errorf("agent ID must include content after prefix (got %q)", id)
+	}
+
+	// Case 1: Town-level roles (gt-mayor, gt-deacon)
+	if len(parts) == 1 {
+		role := parts[0]
+		if isTownLevelRole(role) {
+			return nil // Valid town-level agent
+		}
+		if isValidRole(role) {
+			return fmt.Errorf("agent role %q requires rig: <prefix>-<rig>-%s (got %q)", role, role, id)
+		}
+		return fmt.Errorf("invalid agent role %q (valid: %s)", role, strings.Join(ValidAgentRoles, ", "))
+	}
+
+	// Case 2: Rig-level roles (<prefix>-<rig>-witness, <prefix>-<rig>-refinery)
+	if len(parts) == 2 {
+		rig, role := parts[0], parts[1]
+
+		if isRigLevelRole(role) {
+			if rig == "" {
+				return fmt.Errorf("rig name cannot be empty in %q", id)
+			}
+			return nil // Valid rig-level singleton agent
+		}
+
+		if isNamedRole(role) {
+			return fmt.Errorf("agent role %q requires name: <prefix>-<rig>-%s-<name> (got %q)", role, role, id)
+		}
+
+		if isTownLevelRole(role) {
+			return fmt.Errorf("town-level agent %q cannot have rig suffix (expected <prefix>-%s, got %q)", role, role, id)
+		}
+
+		// First part might be a rig name with second part being something invalid
+		return fmt.Errorf("invalid agent format: expected <prefix>-<rig>-<role>[-<name>] where role is one of: %s (got %q)", strings.Join(ValidAgentRoles, ", "), id)
+	}
+
+	// Case 3: Named roles (<prefix>-<rig>-crew-<name>, <prefix>-<rig>-polecat-<name>)
+	if len(parts) >= 3 {
+		rig, role := parts[0], parts[1]
+		name := strings.Join(parts[2:], "-") // Allow hyphens in names
+
+		if isNamedRole(role) {
+			if rig == "" {
+				return fmt.Errorf("rig name cannot be empty in %q", id)
+			}
+			if name == "" {
+				return fmt.Errorf("agent name cannot be empty in %q", id)
+			}
+			return nil // Valid named agent
+		}
+
+		if isRigLevelRole(role) {
+			return fmt.Errorf("agent role %q cannot have name suffix (expected <prefix>-<rig>-%s, got %q)", role, role, id)
+		}
+
+		if isTownLevelRole(role) {
+			return fmt.Errorf("town-level agent %q cannot have rig/name suffixes (expected <prefix>-%s, got %q)", role, role, id)
+		}
+
+		return fmt.Errorf("invalid agent format: expected <prefix>-<rig>-<role>-<name> where role is one of: %s (got %q)", strings.Join(NamedRoles, ", "), id)
+	}
+
+	return fmt.Errorf("invalid agent ID format: %q", id)
 }

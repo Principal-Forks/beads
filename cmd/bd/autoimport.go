@@ -9,15 +9,31 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 	"gopkg.in/yaml.v3"
 )
+
+// readFromGitRef reads file content from a git ref (branch or commit).
+// Returns the raw bytes from git show <ref>:<path>.
+// The filePath is automatically converted to forward slashes for Windows compatibility.
+// Returns nil, err if the git command fails (e.g., file not found in ref).
+func readFromGitRef(filePath, gitRef string) ([]byte, error) {
+	gitPath := filepath.ToSlash(filePath)
+	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204 - git command with safe args
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from git: %w", err)
+	}
+	return output, nil
+}
 
 // checkAndAutoImport checks if the database is empty but git has issues.
 // If so, it automatically imports them and returns true.
@@ -68,13 +84,13 @@ func checkAndAutoImport(ctx context.Context, store storage.Storage) bool {
 // Returns (issue_count, relative_jsonl_path, git_ref)
 func checkGitForIssues() (int, string, string) {
 	// Try to find .beads directory
-	beadsDir := findBeadsDir()
+	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
 		return 0, "", ""
 	}
 
 	// Construct relative path from git root
-	gitRoot := findGitRoot()
+	gitRoot := git.GetRepoRoot()
 	if gitRoot == "" {
 		return 0, "", ""
 	}
@@ -128,10 +144,7 @@ func checkGitForIssues() (int, string, string) {
 	}
 
 	for _, relPath := range candidates {
-		// Use ToSlash for git path compatibility on Windows
-		gitPath := filepath.ToSlash(relPath)
-		cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204 - git command with safe args
-		output, err := cmd.Output()
+		output, err := readFromGitRef(relPath, gitRef)
 		if err == nil && len(output) > 0 {
 			lines := bytes.Count(output, []byte("\n"))
 			if lines > 0 {
@@ -161,6 +174,7 @@ func isNoDbModeConfigured(beadsDir string) bool {
 
 	var cfg localConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		debug.Logf("Warning: failed to parse config.yaml for no-db check: %v", err)
 		return false
 	}
 
@@ -186,81 +200,19 @@ func getLocalSyncBranch(beadsDir string) string {
 	// Parse YAML properly to handle edge cases (comments, indentation, special chars)
 	var cfg localConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		debug.Logf("Warning: failed to parse config.yaml for sync-branch: %v", err)
 		return ""
 	}
 
 	return cfg.SyncBranch
 }
 
-// findBeadsDir finds the .beads directory in current or parent directories
-func findBeadsDir() string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
 
-	for {
-		beadsDir := filepath.Join(dir, ".beads")
-		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
-			// Resolve symlinks to get canonical path (fixes macOS /var -> /private/var)
-			resolved, err := filepath.EvalSymlinks(beadsDir)
-			if err != nil {
-				return beadsDir // Fall back to unresolved if EvalSymlinks fails
-			}
-			return resolved
-		}
 
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			// Reached root
-			break
-		}
-		dir = parent
-	}
-
-	return ""
-}
-
-// findGitRoot finds the git repository root
-func findGitRoot() string {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	root := string(bytes.TrimSpace(output))
-
-	// Normalize path for the current OS
-	// Git on Windows may return paths with forward slashes (C:/Users/...)
-	// or Unix-style paths (/c/Users/...), convert to native format
-	if runtime.GOOS == "windows" {
-		if len(root) > 0 && root[0] == '/' && len(root) >= 3 && root[2] == '/' {
-			// Convert /c/Users/... to C:\Users\...
-			root = strings.ToUpper(string(root[1])) + ":" + filepath.FromSlash(root[2:])
-		} else {
-			// Convert C:/Users/... to C:\Users\...
-			root = filepath.FromSlash(root)
-		}
-	}
-
-	// Resolve symlinks to get canonical path (fixes macOS /var -> /private/var)
-	resolved, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return root // Fall back to unresolved if EvalSymlinks fails
-	}
-	return resolved
-}
-
-// importFromGit imports issues from git at the specified ref (bd-0is: supports sync-branch)
-func importFromGit(ctx context.Context, dbFilePath string, store storage.Storage, jsonlPath, gitRef string) error {
-	// Get content from git (use ToSlash for Windows compatibility)
-	gitPath := filepath.ToSlash(jsonlPath)
-	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204 - git command with safe args
-	jsonlData, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to read from git: %w", err)
-	}
-
+// importFromJSONLData imports issues from raw JSONL bytes.
+// This is the shared implementation used by both importFromGit and importFromLocalJSONL.
+// Returns the number of issues imported and any error.
+func importFromJSONLData(ctx context.Context, dbFilePath string, store storage.Storage, jsonlData []byte) (int, error) {
 	// Parse JSONL data
 	scanner := bufio.NewScanner(bytes.NewReader(jsonlData))
 	// Increase buffer size to handle large JSONL lines (e.g., big descriptions)
@@ -275,25 +227,25 @@ func importFromGit(ctx context.Context, dbFilePath string, store storage.Storage
 
 		var issue types.Issue
 		if err := json.Unmarshal([]byte(line), &issue); err != nil {
-			return fmt.Errorf("failed to parse issue: %w", err)
+			return 0, fmt.Errorf("failed to parse issue: %w", err)
 		}
+		issue.SetDefaults() // Apply defaults for omitted fields
 		issues = append(issues, &issue)
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to scan JSONL: %w", err)
+		return 0, fmt.Errorf("failed to scan JSONL: %w", err)
 	}
 
-	// CRITICAL (bd-166): Set issue_prefix from first imported issue if missing
+	// CRITICAL: Set issue_prefix from first imported issue if missing
 	// This prevents derivePrefixFromPath fallback which caused duplicate issues
 	if len(issues) > 0 {
 		configuredPrefix, err := store.GetConfig(ctx, "issue_prefix")
 		if err == nil && strings.TrimSpace(configuredPrefix) == "" {
-			// Database has no prefix configured - derive from first issue
 			firstPrefix := utils.ExtractIssuePrefix(issues[0].ID)
 			if firstPrefix != "" {
 				if err := store.SetConfig(ctx, "issue_prefix", firstPrefix); err != nil {
-					return fmt.Errorf("failed to set issue_prefix from imported issues: %w", err)
+					return 0, fmt.Errorf("failed to set issue_prefix from imported issues: %w", err)
 				}
 			}
 		}
@@ -301,14 +253,39 @@ func importFromGit(ctx context.Context, dbFilePath string, store storage.Storage
 
 	// Use existing import logic with auto-resolve collisions
 	// Note: SkipPrefixValidation allows mixed prefixes during auto-import
-	// (but now we set the prefix first, so CreateIssue won't use filename fallback)
 	opts := ImportOptions{
 		DryRun:               false,
 		SkipUpdate:           false,
-		SkipPrefixValidation: true,  // Auto-import is lenient about prefixes
-		NoGitHistory:         true,  // Skip git history backfill during auto-import (bd-4pv)
+		SkipPrefixValidation: true,
 	}
 
-	_, err = importIssuesCore(ctx, dbFilePath, store, issues, opts)
+	_, err := importIssuesCore(ctx, dbFilePath, store, issues, opts)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(issues), nil
+}
+
+// importFromLocalJSONL imports issues from a local JSONL file on disk.
+// Unlike importFromGit, this reads from the current working tree, preserving
+// any manual cleanup done to the JSONL file (e.g., via bd compact --purge-tombstones).
+// Returns the number of issues imported and any error.
+func importFromLocalJSONL(ctx context.Context, dbFilePath string, store storage.Storage, localPath string) (int, error) {
+	// #nosec G304 -- path provided by bd init command
+	jsonlData, err := os.ReadFile(localPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read local JSONL file: %w", err)
+	}
+	return importFromJSONLData(ctx, dbFilePath, store, jsonlData)
+}
+
+// importFromGit imports issues from git at the specified ref (bd-0is: supports sync-branch)
+func importFromGit(ctx context.Context, dbFilePath string, store storage.Storage, jsonlPath, gitRef string) error {
+	jsonlData, err := readFromGitRef(jsonlPath, gitRef)
+	if err != nil {
+		return err
+	}
+	_, err = importFromJSONLData(ctx, dbFilePath, store, jsonlData)
 	return err
 }

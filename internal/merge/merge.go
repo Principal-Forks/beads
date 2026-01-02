@@ -44,7 +44,7 @@ type Issue struct {
 	Description  string       `json:"description,omitempty"`
 	Notes        string       `json:"notes,omitempty"`
 	Status       string       `json:"status,omitempty"`
-	Priority     int          `json:"priority,omitempty"`
+	Priority     int          `json:"priority"` // No omitempty: 0 is valid (P0/critical)
 	IssueType    string       `json:"issue_type,omitempty"`
 	CreatedAt    string       `json:"created_at,omitempty"`
 	UpdatedAt    string       `json:"updated_at,omitempty"`
@@ -52,7 +52,7 @@ type Issue struct {
 	CreatedBy    string       `json:"created_by,omitempty"`
 	Dependencies []Dependency `json:"dependencies,omitempty"`
 	RawLine      string       `json:"-"` // Store original line for conflict output
-	// Tombstone fields (bd-0ih): inline soft-delete support for merge
+	// Tombstone fields: inline soft-delete support for merge
 	DeletedAt    string `json:"deleted_at,omitempty"`    // When the issue was deleted
 	DeletedBy    string `json:"deleted_by,omitempty"`    // Who deleted the issue
 	DeleteReason string `json:"delete_reason,omitempty"` // Why the issue was deleted
@@ -113,7 +113,7 @@ func Merge3Way(outputPath, basePath, leftPath, rightPath string, debug bool) err
 	}
 
 	// Perform 3-way merge
-	result, conflicts := merge3Way(baseIssues, leftIssues, rightIssues)
+	result, conflicts := merge3Way(baseIssues, leftIssues, rightIssues, debug)
 
 	if debug {
 		fmt.Fprintf(os.Stderr, "Merge complete:\n")
@@ -240,8 +240,11 @@ func makeKey(issue Issue) IssueKey {
 	}
 }
 
-// bd-ig5: Use constants from types package to avoid duplication
-const StatusTombstone = string(types.StatusTombstone)
+// Use constants from types package to avoid duplication
+const (
+	StatusTombstone = string(types.StatusTombstone)
+	StatusClosed    = string(types.StatusClosed)
+)
 
 // Alias TTL constants from types package for local use
 var (
@@ -291,14 +294,17 @@ func IsExpiredTombstone(issue Issue, ttl time.Duration) bool {
 	return time.Now().After(expirationTime)
 }
 
-func merge3Way(base, left, right []Issue) ([]Issue, []string) {
-	return merge3WayWithTTL(base, left, right, DefaultTombstoneTTL)
+func merge3Way(base, left, right []Issue, debug bool) ([]Issue, []string) {
+	return Merge3WayWithTTL(base, left, right, DefaultTombstoneTTL, debug)
 }
 
-// merge3WayWithTTL performs a 3-way merge with configurable tombstone TTL.
+// Merge3WayWithTTL performs a 3-way merge with configurable tombstone TTL.
 // This is the core merge function that handles tombstone semantics.
-func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []string) {
-	// Build maps for quick lookup
+// Use this when you need to configure TTL for testing, debugging, or
+// per-repository configuration. For default TTL behavior, use merge3Way.
+// When debug is true, logs resurrection events to stderr.
+func Merge3WayWithTTL(base, left, right []Issue, ttl time.Duration, debug bool) ([]Issue, []string) {
+	// Build maps for quick lookup by IssueKey
 	baseMap := make(map[IssueKey]Issue)
 	for _, issue := range base {
 		baseMap[makeKey(issue)] = issue
@@ -314,8 +320,22 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 		rightMap[makeKey(issue)] = issue
 	}
 
-	// Track which issues we've processed
+	// Also build ID-based maps for fallback matching
+	// This handles cases where the same issue has slightly different CreatedAt/CreatedBy
+	// (e.g., due to timestamp precision differences between systems)
+	leftByID := make(map[string]Issue)
+	for _, issue := range left {
+		leftByID[issue.ID] = issue
+	}
+
+	rightByID := make(map[string]Issue)
+	for _, issue := range right {
+		rightByID[issue.ID] = issue
+	}
+
+	// Track which issues we've processed (by both key and ID)
 	processed := make(map[IssueKey]bool)
+	processedIDs := make(map[string]bool) // track processed IDs to avoid duplicates
 	var result []Issue
 	var conflicts []string
 
@@ -341,6 +361,43 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 		leftIssue, inLeft := leftMap[key]
 		rightIssue, inRight := rightMap[key]
 
+		// ID-based fallback matching for tombstone preservation
+		// If key doesn't match but same ID exists in the other side, use that
+		if !inLeft && inRight {
+			if fallback, found := leftByID[rightIssue.ID]; found {
+				leftIssue = fallback
+				inLeft = true
+				// Mark the fallback's key as processed to avoid duplicate
+				processed[makeKey(fallback)] = true
+			}
+		}
+		if !inRight && inLeft {
+			if fallback, found := rightByID[leftIssue.ID]; found {
+				rightIssue = fallback
+				inRight = true
+				// Mark the fallback's key as processed to avoid duplicate
+				processed[makeKey(fallback)] = true
+			}
+		}
+
+		// Check if we've already processed this ID (via a different key)
+		currentID := key.ID
+		if currentID == "" {
+			if inLeft {
+				currentID = leftIssue.ID
+			} else if inRight {
+				currentID = rightIssue.ID
+			} else if inBase {
+				currentID = baseIssue.ID
+			}
+		}
+		if currentID != "" && processedIDs[currentID] {
+			continue
+		}
+		if currentID != "" {
+			processedIDs[currentID] = true
+		}
+
 		// Determine tombstone status
 		leftTombstone := inLeft && IsTombstone(leftIssue)
 		rightTombstone := inRight && IsTombstone(rightIssue)
@@ -360,6 +417,9 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			if leftTombstone && !rightTombstone {
 				if IsExpiredTombstone(leftIssue, ttl) {
 					// Tombstone expired - resurrection allowed, keep live issue
+					if debug {
+						fmt.Fprintf(os.Stderr, "Issue %s resurrected (tombstone expired)\n", rightIssue.ID)
+					}
 					result = append(result, rightIssue)
 				} else {
 					// Tombstone wins
@@ -372,6 +432,9 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			if rightTombstone && !leftTombstone {
 				if IsExpiredTombstone(rightIssue, ttl) {
 					// Tombstone expired - resurrection allowed, keep live issue
+					if debug {
+						fmt.Fprintf(os.Stderr, "Issue %s resurrected (tombstone expired)\n", leftIssue.ID)
+					}
 					result = append(result, leftIssue)
 				} else {
 					// Tombstone wins
@@ -400,6 +463,9 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			// CASE: Left is tombstone, right is live
 			if leftTombstone && !rightTombstone {
 				if IsExpiredTombstone(leftIssue, ttl) {
+					if debug {
+						fmt.Fprintf(os.Stderr, "Issue %s resurrected (tombstone expired)\n", rightIssue.ID)
+					}
 					result = append(result, rightIssue)
 				} else {
 					result = append(result, leftIssue)
@@ -410,6 +476,9 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			// CASE: Right is tombstone, left is live
 			if rightTombstone && !leftTombstone {
 				if IsExpiredTombstone(rightIssue, ttl) {
+					if debug {
+						fmt.Fprintf(os.Stderr, "Issue %s resurrected (tombstone expired)\n", leftIssue.ID)
+					}
 					result = append(result, leftIssue)
 				} else {
 					result = append(result, rightIssue)
@@ -427,7 +496,7 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			result = append(result, merged)
 		} else if inBase && inLeft && !inRight {
 			// Deleted in right (implicitly), maybe modified in left
-			// bd-ki14: Check if left is a tombstone - tombstones must be preserved
+			// Check if left is a tombstone - tombstones must be preserved
 			if leftTombstone {
 				result = append(result, leftIssue)
 				continue
@@ -437,7 +506,7 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 			continue
 		} else if inBase && !inLeft && inRight {
 			// Deleted in left (implicitly), maybe modified in right
-			// bd-ki14: Check if right is a tombstone - tombstones must be preserved
+			// Check if right is a tombstone - tombstones must be preserved
 			if rightTombstone {
 				result = append(result, rightIssue)
 				continue
@@ -460,7 +529,7 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 // mergeTombstones merges two tombstones for the same issue.
 // The tombstone with the later deleted_at timestamp wins.
 //
-// bd-6x5: Edge cases for empty DeletedAt:
+// Edge cases for empty DeletedAt:
 //   - If both empty: left wins (arbitrary but deterministic)
 //   - If left empty, right not: right wins (has timestamp)
 //   - If right empty, left not: left wins (has timestamp)
@@ -468,7 +537,7 @@ func merge3WayWithTTL(base, left, right []Issue, ttl time.Duration) ([]Issue, []
 // Empty DeletedAt shouldn't happen in valid data (validation catches it),
 // but we handle it defensively here.
 func mergeTombstones(left, right Issue) Issue {
-	// bd-6x5: Handle empty DeletedAt explicitly for clarity
+	// Handle empty DeletedAt explicitly for clarity
 	if left.DeletedAt == "" && right.DeletedAt == "" {
 		// Both invalid - left wins as tie-breaker
 		return left
@@ -518,16 +587,16 @@ func mergeIssue(base, left, right Issue) (Issue, string) {
 
 	// Merge closed_at - only if status is closed
 	// This prevents invalid state (status=open with closed_at set)
-	if result.Status == "closed" {
+	if result.Status == StatusClosed {
 		result.ClosedAt = maxTime(left.ClosedAt, right.ClosedAt)
 	} else {
 		result.ClosedAt = ""
 	}
 
-	// Merge dependencies - combine and deduplicate
-	result.Dependencies = mergeDependencies(left.Dependencies, right.Dependencies)
+	// Merge dependencies - proper 3-way merge where removals win
+	result.Dependencies = mergeDependencies(base.Dependencies, left.Dependencies, right.Dependencies)
 
-	// bd-1sn: If status became tombstone via mergeStatus safety fallback,
+	// If status became tombstone via mergeStatus safety fallback,
 	// copy tombstone fields from whichever side has them
 	if result.Status == StatusTombstone {
 		// Prefer the side with more recent deleted_at, or left if tied
@@ -569,8 +638,8 @@ func mergeStatus(base, left, right string) string {
 
 	// RULE 1: closed always wins over open
 	// This prevents the insane situation where issues never die
-	if left == "closed" || right == "closed" {
-		return "closed"
+	if left == StatusClosed || right == StatusClosed {
+		return StatusClosed
 	}
 
 	// Otherwise use standard 3-way merge
@@ -633,7 +702,7 @@ func mergeNotes(base, left, right string) string {
 
 // mergePriority handles priority merging - on conflict, higher priority wins (lower number)
 // Special case: 0 is treated as "unset/no priority" due to Go's zero value.
-// Any explicitly set priority (!=0) wins over 0. (bd-d0t fix, bd-1kf fix)
+// Any explicitly set priority (!=0) wins over 0.
 func mergePriority(base, left, right int) int {
 	// Standard 3-way merge for non-conflict cases
 	if base == left && base != right {
@@ -647,8 +716,8 @@ func mergePriority(base, left, right int) int {
 	}
 	// True conflict: both sides changed to different values
 
-	// bd-d0t fix: Treat 0 as "unset" - explicitly set priority wins over unset
-	// bd-1kf fix: Use != 0 instead of > 0 to handle negative priorities
+	// Treat 0 as "unset" - explicitly set priority wins over unset
+	// Use != 0 instead of > 0 to handle negative priorities
 	if left == 0 && right != 0 {
 		return right // right has explicit priority, left is unset
 	}
@@ -695,7 +764,7 @@ func isTimeAfter(t1, t2 string) bool {
 		return true // t1 valid, t2 invalid - t1 wins
 	}
 
-	// Both valid - compare. On exact tie, left wins for consistency with IssueType rule (bd-8nz)
+	// Both valid - compare. On exact tie, left wins for consistency with IssueType rule
 	// Using !time2.After(time1) returns true when t1 > t2 OR t1 == t2
 	return !time2.After(time1)
 }
@@ -741,23 +810,87 @@ func maxTime(t1, t2 string) string {
 	return t2
 }
 
-func mergeDependencies(left, right []Dependency) []Dependency {
-	seen := make(map[string]bool)
-	var result []Dependency
-
-	for _, dep := range left {
-		key := fmt.Sprintf("%s:%s:%s", dep.IssueID, dep.DependsOnID, dep.Type)
-		if !seen[key] {
-			seen[key] = true
-			result = append(result, dep)
-		}
+// mergeDependencies performs a proper 3-way merge of dependencies
+// Key principle: REMOVALS ARE AUTHORITATIVE
+// - If dep was in base and removed by left OR right → exclude (removal wins)
+// - If dep wasn't in base and added by left OR right → include
+// - If dep was in base and both still have it → include
+func mergeDependencies(base, left, right []Dependency) []Dependency {
+	// Build sets for O(1) lookup
+	depKey := func(dep Dependency) string {
+		return fmt.Sprintf("%s:%s:%s", dep.IssueID, dep.DependsOnID, dep.Type)
 	}
 
+	baseSet := make(map[string]bool)
+	for _, dep := range base {
+		baseSet[depKey(dep)] = true
+	}
+
+	leftSet := make(map[string]bool)
+	leftDeps := make(map[string]Dependency)
+	for _, dep := range left {
+		key := depKey(dep)
+		leftSet[key] = true
+		leftDeps[key] = dep
+	}
+
+	rightSet := make(map[string]bool)
+	rightDeps := make(map[string]Dependency)
 	for _, dep := range right {
-		key := fmt.Sprintf("%s:%s:%s", dep.IssueID, dep.DependsOnID, dep.Type)
+		key := depKey(dep)
+		rightSet[key] = true
+		rightDeps[key] = dep
+	}
+
+	// Collect all unique keys
+	allKeys := make(map[string]bool)
+	for k := range baseSet {
+		allKeys[k] = true
+	}
+	for k := range leftSet {
+		allKeys[k] = true
+	}
+	for k := range rightSet {
+		allKeys[k] = true
+	}
+
+	var result []Dependency
+	seen := make(map[string]bool)
+
+	for key := range allKeys {
+		inBase := baseSet[key]
+		inLeft := leftSet[key]
+		inRight := rightSet[key]
+
+		// 3-way merge logic:
+		if inBase {
+			// Was in base - check if either side removed it
+			if !inLeft {
+				// Left removed it → don't include (left wins)
+				continue
+			}
+			if !inRight {
+				// Right removed it → don't include (right wins)
+				continue
+			}
+			// Both still have it → include
+		} else {
+			// Wasn't in base - must have been added by left or right
+			if !inLeft && !inRight {
+				// Neither has it (shouldn't happen but handle gracefully)
+				continue
+			}
+			// At least one side added it → include
+		}
+
 		if !seen[key] {
 			seen[key] = true
-			result = append(result, dep)
+			// Prefer left's version of the dep (for any metadata differences)
+			if dep, ok := leftDeps[key]; ok {
+				result = append(result, dep)
+			} else if dep, ok := rightDeps[key]; ok {
+				result = append(result, dep)
+			}
 		}
 	}
 

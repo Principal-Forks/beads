@@ -4,27 +4,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/validation"
 )
 
 var createCmd = &cobra.Command{
 	Use:     "create [title]",
+	GroupID: "issues",
 	Aliases: []string{"new"},
 	Short:   "Create a new issue (or multiple issues from markdown file)",
 	Args:    cobra.MinimumNArgs(0), // Changed to allow no args when using -f
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("create")
 		file, _ := cmd.Flags().GetString("file")
-		fromTemplate, _ := cmd.Flags().GetString("from-template")
 
 		// If file flag is provided, parse markdown and create multiple issues
 		if file != "" {
@@ -54,63 +59,43 @@ var createCmd = &cobra.Command{
 			FatalError("title required (or use --file to create from markdown)")
 		}
 
-		// Warn if creating a test issue in production database
-		if strings.HasPrefix(strings.ToLower(title), "test") {
-			yellow := color.New(color.FgYellow).SprintFunc()
-			fmt.Fprintf(os.Stderr, "%s Creating issue with 'Test' prefix in production database.\n", yellow("⚠"))
+		// Get silent flag
+		silent, _ := cmd.Flags().GetBool("silent")
+
+		// Warn if creating a test issue in production database (unless silent mode)
+		if strings.HasPrefix(strings.ToLower(title), "test") && !silent && !debug.IsQuiet() {
+			fmt.Fprintf(os.Stderr, "%s Creating issue with 'Test' prefix in production database.\n", ui.RenderWarn("⚠"))
 			fmt.Fprintf(os.Stderr, "  For testing, consider using: BEADS_DB=/tmp/test.db ./bd create \"Test issue\"\n")
 		}
 
-		// Load template if specified
-		var tmpl *Template
-		if fromTemplate != "" {
-			var err error
-			tmpl, err = loadTemplate(fromTemplate)
-			if err != nil {
-				FatalError("%v", err)
+		// Get field values
+		description, _ := getDescriptionFlag(cmd)
+
+		// Check if description is required by config
+		if description == "" && !strings.Contains(strings.ToLower(title), "test") {
+			if config.GetBool("create.require-description") {
+				FatalError("description is required (set create.require-description: false in config.yaml to disable)")
+			}
+			// Warn if creating an issue without a description (unless silent mode)
+			if !silent && !debug.IsQuiet() {
+				fmt.Fprintf(os.Stderr, "%s Creating issue without description.\n", ui.RenderWarn("⚠"))
+				fmt.Fprintf(os.Stderr, "  Issues without descriptions lack context for future work.\n")
+				fmt.Fprintf(os.Stderr, "  Consider adding --description=\"Why this issue exists and what needs to be done\"\n")
 			}
 		}
 
-		// Get field values, preferring explicit flags over template defaults
-		description, _ := getDescriptionFlag(cmd)
-		if description == "" && tmpl != nil {
-			description = tmpl.Description
-		}
-
-		// Warn if creating an issue without a description (unless it's a test issue)
-		if description == "" && !strings.Contains(strings.ToLower(title), "test") {
-			yellow := color.New(color.FgYellow).SprintFunc()
-			fmt.Fprintf(os.Stderr, "%s Creating issue without description.\n", yellow("⚠"))
-			fmt.Fprintf(os.Stderr, "  Issues without descriptions lack context for future work.\n")
-			fmt.Fprintf(os.Stderr, "  Consider adding --description=\"Why this issue exists and what needs to be done\"\n")
-		}
-
 		design, _ := cmd.Flags().GetString("design")
-		if design == "" && tmpl != nil {
-			design = tmpl.Design
-		}
-
 		acceptance, _ := cmd.Flags().GetString("acceptance")
-		if acceptance == "" && tmpl != nil {
-			acceptance = tmpl.AcceptanceCriteria
-		}
-		
+		notes, _ := cmd.Flags().GetString("notes")
+
 		// Parse priority (supports both "1" and "P1" formats)
 		priorityStr, _ := cmd.Flags().GetString("priority")
 		priority, err := validation.ValidatePriority(priorityStr)
 		if err != nil {
 			FatalError("%v", err)
 		}
-		if cmd.Flags().Changed("priority") == false && tmpl != nil {
-			priority = tmpl.Priority
-		}
 
 		issueType, _ := cmd.Flags().GetString("type")
-		if !cmd.Flags().Changed("type") && tmpl != nil && tmpl.Type != "" {
-			// Flag not explicitly set and template has a type, use template
-			issueType = tmpl.Type
-		}
-
 		assignee, _ := cmd.Flags().GetString("assignee")
 
 		labels, _ := cmd.Flags().GetStringSlice("labels")
@@ -118,16 +103,89 @@ var createCmd = &cobra.Command{
 		if len(labelAlias) > 0 {
 			labels = append(labels, labelAlias...)
 		}
-		if len(labels) == 0 && tmpl != nil && len(tmpl.Labels) > 0 {
-			labels = tmpl.Labels
-		}
 
 		explicitID, _ := cmd.Flags().GetString("id")
 		parentID, _ := cmd.Flags().GetString("parent")
 		externalRef, _ := cmd.Flags().GetString("external-ref")
 		deps, _ := cmd.Flags().GetStringSlice("deps")
+		waitsFor, _ := cmd.Flags().GetString("waits-for")
+		waitsForGate, _ := cmd.Flags().GetString("waits-for-gate")
 		forceCreate, _ := cmd.Flags().GetBool("force")
 		repoOverride, _ := cmd.Flags().GetString("repo")
+		rigOverride, _ := cmd.Flags().GetString("rig")
+		prefixOverride, _ := cmd.Flags().GetString("prefix")
+		wisp, _ := cmd.Flags().GetBool("ephemeral")
+		molTypeStr, _ := cmd.Flags().GetString("mol-type")
+		var molType types.MolType
+		if molTypeStr != "" {
+			molType = types.MolType(molTypeStr)
+			if !molType.IsValid() {
+				FatalError("invalid mol-type %q (must be swarm, patrol, or work)", molTypeStr)
+			}
+		}
+
+		// Agent-specific flags
+		roleType, _ := cmd.Flags().GetString("role-type")
+		agentRig, _ := cmd.Flags().GetString("agent-rig")
+
+		// Validate agent-specific flags require --type=agent
+		if (roleType != "" || agentRig != "") && issueType != "agent" {
+			FatalError("--role-type and --agent-rig flags require --type=agent")
+		}
+
+		// Event-specific flags
+		eventCategory, _ := cmd.Flags().GetString("event-category")
+		eventActor, _ := cmd.Flags().GetString("event-actor")
+		eventTarget, _ := cmd.Flags().GetString("event-target")
+		eventPayload, _ := cmd.Flags().GetString("event-payload")
+
+		// Validate event-specific flags require --type=event
+		if (eventCategory != "" || eventActor != "" || eventTarget != "" || eventPayload != "") && issueType != "event" {
+			FatalError("--event-category, --event-actor, --event-target, and --event-payload flags require --type=event")
+		}
+
+		// Parse --due flag (GH#820)
+		// Uses layered parsing: compact duration → NLP → date-only → RFC3339
+		var dueAt *time.Time
+		dueStr, _ := cmd.Flags().GetString("due")
+		if dueStr != "" {
+			t, err := timeparsing.ParseRelativeTime(dueStr, time.Now())
+			if err != nil {
+				FatalError("invalid --due format %q. Examples: +6h, tomorrow, next monday, 2025-01-15", dueStr)
+			}
+			dueAt = &t
+		}
+
+		// Parse --defer flag (GH#820)
+		var deferUntil *time.Time
+		deferStr, _ := cmd.Flags().GetString("defer")
+		if deferStr != "" {
+			t, err := timeparsing.ParseRelativeTime(deferStr, time.Now())
+			if err != nil {
+				FatalError("invalid --defer format %q. Examples: +1h, tomorrow, next monday, 2025-01-15", deferStr)
+			}
+			// Warn if defer date is in the past (user probably meant future)
+			if t.Before(time.Now()) && !silent && !debug.IsQuiet() {
+				fmt.Fprintf(os.Stderr, "%s Defer date %q is in the past. Issue will appear in bd ready immediately.\n",
+					ui.RenderWarn("!"), t.Format("2006-01-02 15:04"))
+				fmt.Fprintf(os.Stderr, "  Did you mean a future date? Use --defer=+1h or --defer=tomorrow\n")
+			}
+			deferUntil = &t
+		}
+
+		// Handle --rig or --prefix flag: create issue in a different rig
+		// Both flags use the same forgiving lookup (accepts rig names or prefixes)
+		targetRig := rigOverride
+		if prefixOverride != "" {
+			if targetRig != "" {
+				FatalError("cannot specify both --rig and --prefix flags")
+			}
+			targetRig = prefixOverride
+		}
+		if targetRig != "" {
+			createInRig(cmd, targetRig, title, description, issueType, priority, design, acceptance, notes, assignee, labels, externalRef, wisp)
+			return
+		}
 
 		// Get estimate if provided
 		var estimatedMinutes *int
@@ -138,6 +196,29 @@ var createCmd = &cobra.Command{
 			}
 			estimatedMinutes = &est
 		}
+
+		// Validate template based on --validate flag or config
+		validateTemplate, _ := cmd.Flags().GetBool("validate")
+		if validateTemplate {
+			// Explicit --validate flag: fail on error
+			if err := validation.ValidateTemplate(types.IssueType(issueType), description); err != nil {
+				FatalError("%v", err)
+			}
+		} else {
+			// Check validation.on-create config (bd-t7jq)
+			validationMode := config.GetString("validation.on-create")
+			if validationMode == "error" || validationMode == "warn" {
+				if err := validation.ValidateTemplate(types.IssueType(issueType), description); err != nil {
+					if validationMode == "error" {
+						FatalError("%v", err)
+					} else {
+						// warn mode: print warning but proceed
+						fmt.Fprintf(os.Stderr, "%s %v\n", ui.RenderWarn("⚠"), err)
+					}
+				}
+			}
+		}
+
 		// Use global jsonOutput set by PersistentPreRun
 
 		// Determine target repository using routing logic
@@ -151,7 +232,7 @@ var createCmd = &cobra.Command{
 			if err != nil {
 				debug.Logf("Warning: failed to detect user role: %v\n", err)
 			}
-			
+
 			routingConfig := &routing.RoutingConfig{
 				Mode:             config.GetString("routing.mode"),
 				DefaultRepo:      config.GetString("routing.default"),
@@ -159,11 +240,11 @@ var createCmd = &cobra.Command{
 				ContributorRepo:  config.GetString("routing.contributor"),
 				ExplicitOverride: repoOverride,
 			}
-			
+
 			repoPath = routing.DetermineTargetRepo(routingConfig, userRole, ".")
 		}
-		
-		// TODO: Switch to target repo for multi-repo support (bd-4ms)
+
+		// TODO(bd-6x6g): Switch to target repo for multi-repo support
 		// For now, we just log the target repo in debug mode
 		if repoPath != "." {
 			debug.Logf("DEBUG: Target repo: %s\n", repoPath)
@@ -207,8 +288,12 @@ var createCmd = &cobra.Command{
 			// Get database prefix from config
 			var dbPrefix string
 			if daemonClient != nil {
-				// TODO(bd-g5p7): Add RPC method to get config in daemon mode
-				// For now, skip validation in daemon mode (needs RPC enhancement)
+				// Daemon mode - use RPC to get config
+				configResp, err := daemonClient.GetConfig(&rpc.GetConfigArgs{Key: "issue_prefix"})
+				if err == nil {
+					dbPrefix = configResp.Value
+				}
+				// If error, continue without validation (non-fatal)
 			} else {
 				// Direct mode - check config
 				dbPrefix, _ = store.GetConfig(ctx, "issue_prefix")
@@ -216,6 +301,13 @@ var createCmd = &cobra.Command{
 
 			if err := validation.ValidatePrefix(requestedPrefix, dbPrefix, forceCreate); err != nil {
 				FatalError("%v", err)
+			}
+
+			// Validate agent ID pattern if type is agent
+			if issueType == "agent" {
+				if err := validation.ValidateAgentID(explicitID); err != nil {
+					FatalError("invalid agent ID: %v", err)
+				}
 			}
 		}
 
@@ -235,11 +327,25 @@ var createCmd = &cobra.Command{
 				Priority:           priority,
 				Design:             design,
 				AcceptanceCriteria: acceptance,
+				Notes:              notes,
 				Assignee:           assignee,
 				ExternalRef:        externalRef,
 				EstimatedMinutes:   estimatedMinutes,
 				Labels:             labels,
 				Dependencies:       deps,
+				WaitsFor:           waitsFor,
+				WaitsForGate:       waitsForGate,
+				Ephemeral:          wisp,
+				CreatedBy:          getActorWithGit(),
+				MolType:            string(molType),
+				RoleType:           roleType,
+				Rig:                agentRig,
+				EventCategory:      eventCategory,
+				EventActor:         eventActor,
+				EventTarget:        eventTarget,
+				EventPayload:       eventPayload,
+				DueAt:              dueStr,
+				DeferUntil:         deferStr,
 			}
 
 			resp, err := daemonClient.Create(createArgs)
@@ -247,19 +353,30 @@ var createCmd = &cobra.Command{
 				FatalError("%v", err)
 			}
 
+			// Parse response to get issue for hook
+			var issue types.Issue
+			if err := json.Unmarshal(resp.Data, &issue); err != nil {
+				FatalError("parsing response: %v", err)
+			}
+
+			// Run create hook
+			if hookRunner != nil {
+				hookRunner.Run(hooks.EventCreate, &issue)
+			}
+
 			if jsonOutput {
 				fmt.Println(string(resp.Data))
+			} else if silent {
+				fmt.Println(issue.ID)
 			} else {
-				var issue types.Issue
-				if err := json.Unmarshal(resp.Data, &issue); err != nil {
-					FatalError("parsing response: %v", err)
-				}
-				green := color.New(color.FgGreen).SprintFunc()
-				fmt.Printf("%s Created issue: %s\n", green("✓"), issue.ID)
+				fmt.Printf("%s Created issue: %s\n", ui.RenderPass("✓"), issue.ID)
 				fmt.Printf("  Title: %s\n", issue.Title)
 				fmt.Printf("  Priority: P%d\n", issue.Priority)
 				fmt.Printf("  Status: %s\n", issue.Status)
 			}
+
+			// Track as last touched issue
+			SetLastTouchedID(issue.ID)
 			return
 		}
 
@@ -270,16 +387,28 @@ var createCmd = &cobra.Command{
 			Description:        description,
 			Design:             design,
 			AcceptanceCriteria: acceptance,
+			Notes:              notes,
 			Status:             types.StatusOpen,
 			Priority:           priority,
 			IssueType:          types.IssueType(issueType),
 			Assignee:           assignee,
 			ExternalRef:        externalRefPtr,
 			EstimatedMinutes:   estimatedMinutes,
+			Ephemeral:          wisp,
+			CreatedBy:          getActorWithGit(),
+			MolType:            molType,
+			RoleType:           roleType,
+			Rig:                agentRig,
+			EventKind:          eventCategory,
+			Actor:              eventActor,
+			Target:             eventTarget,
+			Payload:            eventPayload,
+			DueAt:              dueAt,
+			DeferUntil:         deferUntil,
 		}
 
 		ctx := rootCtx
-		
+
 		// Check if any dependencies are discovered-from type
 		// If so, inherit source_repo from the parent issue
 		var discoveredFromParentID string
@@ -288,16 +417,16 @@ var createCmd = &cobra.Command{
 			if depSpec == "" {
 				continue
 			}
-			
+
 			var depType types.DependencyType
 			var dependsOnID string
-			
+
 			if strings.Contains(depSpec, ":") {
 				parts := strings.SplitN(depSpec, ":", 2)
 				if len(parts) == 2 {
 					depType = types.DependencyType(strings.TrimSpace(parts[0]))
 					dependsOnID = strings.TrimSpace(parts[1])
-					
+
 					if depType == types.DepDiscoveredFrom && dependsOnID != "" {
 						discoveredFromParentID = dependsOnID
 						break
@@ -305,7 +434,7 @@ var createCmd = &cobra.Command{
 				}
 			}
 		}
-		
+
 		// If we found a discovered-from dependency, inherit source_repo from parent
 		if discoveredFromParentID != "" {
 			parentIssue, err := store.GetIssue(ctx, discoveredFromParentID)
@@ -314,7 +443,7 @@ var createCmd = &cobra.Command{
 			}
 			// If error getting parent or parent has no source_repo, continue with default
 		}
-		
+
 		if err := store.CreateIssue(ctx, issue, actor); err != nil {
 			FatalError("%v", err)
 		}
@@ -335,6 +464,22 @@ var createCmd = &cobra.Command{
 		for _, label := range labels {
 			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
 				WarnError("failed to add label %s: %v", label, err)
+			}
+		}
+
+		// Auto-add role_type/rig labels for agent beads (enables filtering queries)
+		if issue.IssueType == types.TypeAgent {
+			if issue.RoleType != "" {
+				agentLabel := "role_type:" + issue.RoleType
+				if err := store.AddLabel(ctx, issue.ID, agentLabel, actor); err != nil {
+					WarnError("failed to add role_type label: %v", err)
+				}
+			}
+			if issue.Rig != "" {
+				rigLabel := "rig:" + issue.Rig
+				if err := store.AddLabel(ctx, issue.ID, rigLabel, actor); err != nil {
+					WarnError("failed to add rig label: %v", err)
+				}
 			}
 		}
 
@@ -381,14 +526,51 @@ var createCmd = &cobra.Command{
 			}
 		}
 
+		// Add waits-for dependency if specified
+		if waitsFor != "" {
+			// Validate gate type
+			gate := waitsForGate
+			if gate == "" {
+				gate = types.WaitsForAllChildren
+			}
+			if gate != types.WaitsForAllChildren && gate != types.WaitsForAnyChildren {
+				FatalError("invalid --waits-for-gate value '%s' (valid: all-children, any-children)", gate)
+			}
+
+			// Create metadata JSON
+			meta := types.WaitsForMeta{
+				Gate: gate,
+			}
+			metaJSON, err := json.Marshal(meta)
+			if err != nil {
+				FatalError("failed to serialize waits-for metadata: %v", err)
+			}
+
+			dep := &types.Dependency{
+				IssueID:     issue.ID,
+				DependsOnID: waitsFor,
+				Type:        types.DepWaitsFor,
+				Metadata:    string(metaJSON),
+			}
+			if err := store.AddDependency(ctx, dep, actor); err != nil {
+				WarnError("failed to add waits-for dependency %s -> %s: %v", issue.ID, waitsFor, err)
+			}
+		}
+
 		// Schedule auto-flush
 		markDirtyAndScheduleFlush()
 
+		// Run create hook
+		if hookRunner != nil {
+			hookRunner.Run(hooks.EventCreate, issue)
+		}
+
 		if jsonOutput {
 			outputJSON(issue)
+		} else if silent {
+			fmt.Println(issue.ID)
 		} else {
-			green := color.New(color.FgGreen).SprintFunc()
-			fmt.Printf("%s Created issue: %s\n", green("✓"), issue.ID)
+			fmt.Printf("%s Created issue: %s\n", ui.RenderPass("✓"), issue.ID)
 			fmt.Printf("  Title: %s\n", issue.Title)
 			fmt.Printf("  Priority: P%d\n", issue.Priority)
 			fmt.Printf("  Status: %s\n", issue.Status)
@@ -396,25 +578,159 @@ var createCmd = &cobra.Command{
 			// Show tip after successful create (direct mode only)
 			maybeShowTip(store)
 		}
+
+		// Track as last touched issue
+		SetLastTouchedID(issue.ID)
 	},
 }
 
 func init() {
 	createCmd.Flags().StringP("file", "f", "", "Create multiple issues from markdown file")
-	createCmd.Flags().String("from-template", "", "Create issue from template (e.g., 'epic', 'bug', 'feature')")
 	createCmd.Flags().String("title", "", "Issue title (alternative to positional argument)")
+	createCmd.Flags().Bool("silent", false, "Output only the issue ID (for scripting)")
 	registerPriorityFlag(createCmd, "2")
-	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore)")
+	createCmd.Flags().StringP("type", "t", "task", "Issue type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role|convoy|event)")
 	registerCommonIssueFlags(createCmd)
 	createCmd.Flags().StringSliceP("labels", "l", []string{}, "Labels (comma-separated)")
 	createCmd.Flags().StringSlice("label", []string{}, "Alias for --labels")
-	_ = createCmd.Flags().MarkHidden("label")
+	_ = createCmd.Flags().MarkHidden("label") // Only fails if flag missing (caught in tests)
 	createCmd.Flags().String("id", "", "Explicit issue ID (e.g., 'bd-42' for partitioning)")
 	createCmd.Flags().String("parent", "", "Parent issue ID for hierarchical child (e.g., 'bd-a3f8e9')")
 	createCmd.Flags().StringSlice("deps", []string{}, "Dependencies in format 'type:id' or 'id' (e.g., 'discovered-from:bd-20,blocks:bd-15' or 'bd-20')")
+	createCmd.Flags().String("waits-for", "", "Spawner issue ID to wait for (creates waits-for dependency for fanout gate)")
+	createCmd.Flags().String("waits-for-gate", "all-children", "Gate type: all-children (wait for all) or any-children (wait for first)")
 	createCmd.Flags().Bool("force", false, "Force creation even if prefix doesn't match database prefix")
 	createCmd.Flags().String("repo", "", "Target repository for issue (overrides auto-routing)")
+	createCmd.Flags().String("rig", "", "Create issue in a different rig (e.g., --rig beads)")
+	createCmd.Flags().String("prefix", "", "Create issue in rig by prefix (e.g., --prefix bd- or --prefix bd or --prefix beads)")
 	createCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
+	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (ephemeral, not exported to JSONL)")
+	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-polecat), patrol (recurring ops), work (default)")
+	createCmd.Flags().Bool("validate", false, "Validate description contains required sections for issue type")
+	// Agent-specific flags (only valid when --type=agent)
+	createCmd.Flags().String("role-type", "", "Agent role type: polecat|crew|witness|refinery|mayor|deacon (requires --type=agent)")
+	createCmd.Flags().String("agent-rig", "", "Agent's rig name (requires --type=agent)")
+	// Event-specific flags (only valid when --type=event)
+	createCmd.Flags().String("event-category", "", "Event category (e.g., patrol.muted, agent.started) (requires --type=event)")
+	createCmd.Flags().String("event-actor", "", "Entity URI who caused this event (requires --type=event)")
+	createCmd.Flags().String("event-target", "", "Entity URI or bead ID affected (requires --type=event)")
+	createCmd.Flags().String("event-payload", "", "Event-specific JSON data (requires --type=event)")
+	// Time-based scheduling flags (GH#820)
+	// Examples:
+	//   --due=+6h           Due in 6 hours
+	//   --due=tomorrow      Due tomorrow
+	//   --due="next monday" Due next Monday
+	//   --due=2025-01-15    Due on specific date
+	//   --defer=+1h         Hidden from bd ready for 1 hour
+	//   --defer=tomorrow    Hidden until tomorrow
+	createCmd.Flags().String("due", "", "Due date/time. Formats: +6h, +1d, +2w, tomorrow, next monday, 2025-01-15")
+	createCmd.Flags().String("defer", "", "Defer until date (issue hidden from bd ready until then). Same formats as --due")
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(createCmd)
+}
+
+// createInRig creates an issue in a different rig using --rig flag.
+// This bypasses the normal daemon/direct flow and directly creates in the target rig.
+func createInRig(cmd *cobra.Command, rigName, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef string, wisp bool) {
+	ctx := rootCtx
+
+	// Find the town-level beads directory (where routes.jsonl lives)
+	townBeadsDir, err := findTownBeadsDir()
+	if err != nil {
+		FatalError("cannot use --rig: %v", err)
+	}
+
+	// Resolve the target rig's beads directory
+	targetBeadsDir, _, err := routing.ResolveBeadsDirForRig(rigName, townBeadsDir)
+	if err != nil {
+		FatalError("%v", err)
+	}
+
+	// Open storage for the target rig
+	targetDBPath := filepath.Join(targetBeadsDir, "beads.db")
+	targetStore, err := sqlite.New(ctx, targetDBPath)
+	if err != nil {
+		FatalError("failed to open rig %q database: %v", rigName, err)
+	}
+	defer func() {
+		if err := targetStore.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close rig database: %v\n", err)
+		}
+	}()
+
+	var externalRefPtr *string
+	if externalRef != "" {
+		externalRefPtr = &externalRef
+	}
+
+	// Create issue without ID - CreateIssue will generate one with the correct prefix
+	issue := &types.Issue{
+		Title:              title,
+		Description:        description,
+		Design:             design,
+		AcceptanceCriteria: acceptance,
+		Notes:              notes,
+		Status:             types.StatusOpen,
+		Priority:           priority,
+		IssueType:          types.IssueType(issueType),
+		Assignee:           assignee,
+		ExternalRef:        externalRefPtr,
+		Ephemeral:          wisp,
+		CreatedBy:          getActorWithGit(),
+	}
+
+	if err := targetStore.CreateIssue(ctx, issue, actor); err != nil {
+		FatalError("failed to create issue in rig %q: %v", rigName, err)
+	}
+
+	// Add labels if specified
+	for _, label := range labels {
+		if err := targetStore.AddLabel(ctx, issue.ID, label, actor); err != nil {
+			WarnError("failed to add label %s: %v", label, err)
+		}
+	}
+
+	// Get silent flag
+	silent, _ := cmd.Flags().GetBool("silent")
+
+	if jsonOutput {
+		outputJSON(issue)
+	} else if silent {
+		fmt.Println(issue.ID)
+	} else {
+		fmt.Printf("%s Created issue in rig %q: %s\n", ui.RenderPass("✓"), rigName, issue.ID)
+		fmt.Printf("  Title: %s\n", issue.Title)
+		fmt.Printf("  Priority: P%d\n", issue.Priority)
+		fmt.Printf("  Status: %s\n", issue.Status)
+	}
+}
+
+// findTownBeadsDir finds the town-level .beads directory (where routes.jsonl lives).
+// It walks up from the current directory looking for a .beads directory with routes.jsonl.
+func findTownBeadsDir() (string, error) {
+	// Start from current directory and walk up
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		beadsDir := filepath.Join(dir, ".beads")
+		routesFile := filepath.Join(beadsDir, routing.RoutesFileName)
+
+		// Check if this .beads directory has routes.jsonl
+		if _, err := os.Stat(routesFile); err == nil {
+			return beadsDir, nil
+		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root
+			break
+		}
+		dir = parent
+	}
+
+	return "", fmt.Errorf("no routes.jsonl found in any parent .beads directory")
 }

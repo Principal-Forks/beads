@@ -13,8 +13,8 @@ import (
 )
 
 var migrateIssuesCmd = &cobra.Command{
-	Use:   "migrate-issues",
-	Short: "Move issues between repositories",
+	Use:     "issues",
+	Short:   "Move issues between repositories",
 	Long: `Move issues from one source repository to another with filtering and dependency preservation.
 
 This command updates the source_repo field for selected issues, allowing you to:
@@ -690,7 +690,7 @@ func loadIDsFromFile(path string) ([]string, error) {
 }
 
 func init() {
-	rootCmd.AddCommand(migrateIssuesCmd)
+	migrateCmd.AddCommand(migrateIssuesCmd)
 
 	migrateIssuesCmd.Flags().String("from", "", "Source repository (required)")
 	migrateIssuesCmd.Flags().String("to", "", "Destination repository (required)")
@@ -706,6 +706,13 @@ func init() {
 	migrateIssuesCmd.Flags().Bool("strict", false, "Fail on orphaned dependencies or missing repos")
 	migrateIssuesCmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 
-	_ = migrateIssuesCmd.MarkFlagRequired("from")
-	_ = migrateIssuesCmd.MarkFlagRequired("to")
+	_ = migrateIssuesCmd.MarkFlagRequired("from") // Only fails if flag missing (caught in tests)
+	_ = migrateIssuesCmd.MarkFlagRequired("to")   // Only fails if flag missing (caught in tests)
+
+	// Backwards compatibility alias at root level (hidden)
+	migrateIssuesAliasCmd := *migrateIssuesCmd
+	migrateIssuesAliasCmd.Use = "migrate-issues"
+	migrateIssuesAliasCmd.Hidden = true
+	migrateIssuesAliasCmd.Deprecated = "use 'bd migrate issues' instead (will be removed in v1.0.0)"
+	rootCmd.AddCommand(&migrateIssuesAliasCmd)
 }

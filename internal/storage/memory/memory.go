@@ -98,6 +98,14 @@ func (m *MemoryStorage) LoadFromIssues(issues []*types.Issue) error {
 				m.counters[prefix] = num
 			}
 		}
+
+		// Update hierarchical child counters based on issue ID
+		// e.g. "bd-a3f8e9.2" -> parent "bd-a3f8e9" counter 2
+		if parentID, childNum, ok := extractParentAndChildNumber(issue.ID); ok {
+			if m.counters[parentID] < childNum {
+				m.counters[parentID] = childNum
+			}
+		}
 	}
 
 	return nil
@@ -155,6 +163,25 @@ func extractPrefixAndNumber(id string) (string, int) {
 		return "", 0
 	}
 	return prefix, num
+}
+
+// extractParentAndChildNumber extracts the parent ID and numeric child counter from an issue ID like
+// "bd-a3f8e9.2" -> ("bd-a3f8e9", 2, true).
+func extractParentAndChildNumber(id string) (string, int, bool) {
+	lastDot := strings.LastIndex(id, ".")
+	if lastDot == -1 {
+		return "", 0, false
+	}
+
+	parentID := id[:lastDot]
+	suffix := id[lastDot+1:]
+
+	var num int
+	if _, err := fmt.Sscanf(suffix, "%d", &num); err != nil {
+		return "", 0, false
+	}
+
+	return parentID, num, true
 }
 
 // CreateIssue creates a new issue
@@ -416,6 +443,14 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 				}
 				issue.ExternalRef = nil
 			}
+		case "close_reason":
+			if v, ok := value.(string); ok {
+				issue.CloseReason = v
+			}
+		case "closed_by_session":
+			if v, ok := value.(string); ok {
+				issue.ClosedBySession = v
+			}
 		}
 	}
 
@@ -440,11 +475,52 @@ func (m *MemoryStorage) UpdateIssue(ctx context.Context, id string, updates map[
 	return nil
 }
 
-// CloseIssue closes an issue with a reason
-func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string) error {
-	return m.UpdateIssue(ctx, id, map[string]interface{}{
-		"status": string(types.StatusClosed),
-	}, actor)
+// CloseIssue closes an issue with a reason.
+// The session parameter tracks which Claude Code session closed the issue (can be empty).
+func (m *MemoryStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
+	updates := map[string]interface{}{
+		"status":       string(types.StatusClosed),
+		"close_reason": reason,
+	}
+	if session != "" {
+		updates["closed_by_session"] = session
+	}
+	return m.UpdateIssue(ctx, id, updates, actor)
+}
+
+// CreateTombstone converts an existing issue to a tombstone record.
+// This is a soft-delete that preserves the issue with status="tombstone".
+func (m *MemoryStorage) CreateTombstone(ctx context.Context, id string, actor string, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	issue, ok := m.issues[id]
+	if !ok {
+		return fmt.Errorf("issue not found: %s", id)
+	}
+
+	now := time.Now()
+	issue.OriginalType = string(issue.IssueType)
+	issue.Status = types.StatusTombstone
+	issue.DeletedAt = &now
+	issue.DeletedBy = actor
+	issue.DeleteReason = reason
+	issue.UpdatedAt = now
+
+	// Mark as dirty for export
+	m.dirty[id] = true
+
+	// Record tombstone creation event
+	event := &types.Event{
+		IssueID:   id,
+		EventType: "deleted",
+		Actor:     actor,
+		Comment:   &reason,
+		CreatedAt: now,
+	}
+	m.events[id] = append(m.events[id], event)
+
+	return nil
 }
 
 // DeleteIssue permanently deletes an issue and all associated data
@@ -540,6 +616,20 @@ func (m *MemoryStorage) SearchIssues(ctx context.Context, query string, filter t
 				}
 			}
 			if !found {
+				continue
+			}
+		}
+
+		// Parent filtering (bd-yqhh): filter children by parent issue
+		if filter.ParentID != nil {
+			isChild := false
+			for _, dep := range m.dependencies[issue.ID] {
+				if dep.Type == types.DepParentChild && dep.DependsOnID == *filter.ParentID {
+					isChild = true
+					break
+				}
+			}
+			if !isChild {
 				continue
 			}
 		}
@@ -654,6 +744,49 @@ func (m *MemoryStorage) GetDependents(ctx context.Context, issueID string) ([]*t
 	return results, nil
 }
 
+// GetDependenciesWithMetadata gets issues that this issue depends on, with dependency type
+func (m *MemoryStorage) GetDependenciesWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var results []*types.IssueWithDependencyMetadata
+	for _, dep := range m.dependencies[issueID] {
+		if issue, exists := m.issues[dep.DependsOnID]; exists {
+			issueCopy := *issue
+			results = append(results, &types.IssueWithDependencyMetadata{
+				Issue:          issueCopy,
+				DependencyType: dep.Type,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// GetDependentsWithMetadata gets issues that depend on this issue, with dependency type
+func (m *MemoryStorage) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*types.IssueWithDependencyMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var results []*types.IssueWithDependencyMetadata
+	for id, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.DependsOnID == issueID {
+				if issue, exists := m.issues[id]; exists {
+					issueCopy := *issue
+					results = append(results, &types.IssueWithDependencyMetadata{
+						Issue:          issueCopy,
+						DependencyType: dep.Type,
+					})
+				}
+				break
+			}
+		}
+	}
+
+	return results, nil
+}
+
 // GetDependencyCounts returns dependency and dependent counts for multiple issues
 func (m *MemoryStorage) GetDependencyCounts(ctx context.Context, issueIDs []string) (map[string]*types.DependencyCounts, error) {
 	m.mu.RLock()
@@ -754,19 +887,43 @@ func (m *MemoryStorage) SetJSONLFileHash(ctx context.Context, fileHash string) e
 
 // GetDependencyTree gets the dependency tree for an issue
 func (m *MemoryStorage) GetDependencyTree(ctx context.Context, issueID string, maxDepth int, showAllPaths bool, reverse bool) ([]*types.TreeNode, error) {
-	// Simplified implementation - just return direct dependencies
-	// Note: reverse parameter is accepted for interface compatibility but not fully implemented in memory storage
+	// Get the root issue first
+	root, err := m.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return nil, nil
+	}
+
+	var nodes []*types.TreeNode
+
+	// Add root node at depth 0
+	rootNode := &types.TreeNode{
+		Depth:    0,
+		ParentID: issueID, // Root's parent is itself
+	}
+	rootNode.ID = root.ID
+	rootNode.Title = root.Title
+	rootNode.Description = root.Description
+	rootNode.Status = root.Status
+	rootNode.Priority = root.Priority
+	rootNode.IssueType = root.IssueType
+	nodes = append(nodes, rootNode)
+
+	// Get dependencies (or dependents if reverse)
+	// Note: reverse mode not fully implemented - uses same logic for now
 	deps, err := m.GetDependencies(ctx, issueID)
 	if err != nil {
 		return nil, err
 	}
 
-	var nodes []*types.TreeNode
+	// Add dependencies at depth 1
 	for _, dep := range deps {
 		node := &types.TreeNode{
-			Depth: 1,
+			Depth:    1,
+			ParentID: issueID, // Parent is the root
 		}
-		// Copy issue fields
 		node.ID = dep.ID
 		node.Title = dep.Title
 		node.Description = dep.Description
@@ -867,16 +1024,277 @@ func (m *MemoryStorage) GetIssuesByLabel(ctx context.Context, label string) ([]*
 	return results, nil
 }
 
-// Stub implementations for other required methods
+// GetReadyWork returns issues that are ready to work on (no open blockers)
 func (m *MemoryStorage) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
-	// Simplified: return open issues with no blocking dependencies
-	return m.SearchIssues(ctx, "", types.IssueFilter{
-		Status: func() *types.Status { s := types.StatusOpen; return &s }(),
-	})
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var results []*types.Issue
+
+	for _, issue := range m.issues {
+		// Skip pinned issues - they are context markers, not actionable work (bd-o9o)
+		if issue.Pinned {
+			continue
+		}
+
+		// Status filtering: default to open OR in_progress if not specified
+		if filter.Status == "" {
+			if issue.Status != types.StatusOpen && issue.Status != types.StatusInProgress {
+				continue
+			}
+		} else if issue.Status != filter.Status {
+			continue
+		}
+
+		// Priority filtering
+		if filter.Priority != nil && issue.Priority != *filter.Priority {
+			continue
+		}
+
+		// Type filtering (gt-7xtn)
+		if filter.Type != "" {
+			if string(issue.IssueType) != filter.Type {
+				continue
+			}
+		} else {
+			// Exclude workflow types from ready work by default
+			// These are internal workflow items, not work for polecats to claim
+			switch issue.IssueType {
+			case types.TypeMergeRequest, types.TypeGate, types.TypeMolecule, types.TypeMessage:
+				continue
+			}
+		}
+
+		// Unassigned takes precedence over Assignee filter
+		if filter.Unassigned {
+			if issue.Assignee != "" {
+				continue
+			}
+		} else if filter.Assignee != nil {
+			if issue.Assignee != *filter.Assignee {
+				continue
+			}
+		}
+
+		// Label filtering (AND semantics)
+		if len(filter.Labels) > 0 {
+			issueLabels := m.labels[issue.ID]
+			hasAllLabels := true
+			for _, reqLabel := range filter.Labels {
+				found := false
+				for _, label := range issueLabels {
+					if label == reqLabel {
+						found = true
+						break
+					}
+				}
+				if !found {
+					hasAllLabels = false
+					break
+				}
+			}
+			if !hasAllLabels {
+				continue
+			}
+		}
+
+		// Label filtering (OR semantics)
+		if len(filter.LabelsAny) > 0 {
+			issueLabels := m.labels[issue.ID]
+			hasAnyLabel := false
+			for _, reqLabel := range filter.LabelsAny {
+				for _, label := range issueLabels {
+					if label == reqLabel {
+						hasAnyLabel = true
+						break
+					}
+				}
+				if hasAnyLabel {
+					break
+				}
+			}
+			if !hasAnyLabel {
+				continue
+			}
+		}
+
+		// Skip issues with any open 'blocks' dependencies
+		if len(m.getOpenBlockers(issue.ID)) > 0 {
+			continue
+		}
+
+		issueCopy := *issue
+		if deps, ok := m.dependencies[issue.ID]; ok {
+			issueCopy.Dependencies = deps
+		}
+		if labels, ok := m.labels[issue.ID]; ok {
+			issueCopy.Labels = labels
+		}
+		if comments, ok := m.comments[issue.ID]; ok {
+			issueCopy.Comments = comments
+		}
+
+		results = append(results, &issueCopy)
+	}
+
+	// Default to hybrid sort for backwards compatibility
+	sortPolicy := filter.SortPolicy
+	if sortPolicy == "" {
+		sortPolicy = types.SortPolicyHybrid
+	}
+
+	switch sortPolicy {
+	case types.SortPolicyOldest:
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].CreatedAt.Before(results[j].CreatedAt)
+		})
+	case types.SortPolicyPriority:
+		sort.Slice(results, func(i, j int) bool {
+			if results[i].Priority != results[j].Priority {
+				return results[i].Priority < results[j].Priority
+			}
+			return results[i].CreatedAt.Before(results[j].CreatedAt)
+		})
+	case types.SortPolicyHybrid:
+		fallthrough
+	default:
+		cutoff := time.Now().Add(-48 * time.Hour)
+		sort.Slice(results, func(i, j int) bool {
+			iRecent := results[i].CreatedAt.After(cutoff)
+			jRecent := results[j].CreatedAt.After(cutoff)
+			if iRecent != jRecent {
+				return iRecent // recent first
+			}
+			if iRecent {
+				if results[i].Priority != results[j].Priority {
+					return results[i].Priority < results[j].Priority
+				}
+			}
+			return results[i].CreatedAt.Before(results[j].CreatedAt)
+		})
+	}
+
+	// Apply limit
+	if filter.Limit > 0 && len(results) > filter.Limit {
+		results = results[:filter.Limit]
+	}
+
+	return results, nil
 }
 
-func (m *MemoryStorage) GetBlockedIssues(ctx context.Context) ([]*types.BlockedIssue, error) {
-	return nil, nil
+// getOpenBlockers returns the IDs of blockers that are currently open/in_progress/blocked/deferred/hooked.
+// The caller must hold at least a read lock.
+func (m *MemoryStorage) getOpenBlockers(issueID string) []string {
+	deps := m.dependencies[issueID]
+	if len(deps) == 0 {
+		return nil
+	}
+
+	blockers := make([]string, 0)
+	for _, dep := range deps {
+		if dep.Type != types.DepBlocks {
+			continue
+		}
+		blocker, ok := m.issues[dep.DependsOnID]
+		if !ok {
+			// If the blocker is missing, treat it as still blocking (data is incomplete)
+			blockers = append(blockers, dep.DependsOnID)
+			continue
+		}
+		switch blocker.Status {
+		case types.StatusOpen, types.StatusInProgress, types.StatusBlocked, types.StatusDeferred, types.StatusHooked:
+			blockers = append(blockers, blocker.ID)
+		}
+	}
+
+	sort.Strings(blockers)
+	return blockers
+}
+
+// GetBlockedIssues returns issues that are blocked by other issues
+// Note: Pinned issues are excluded from the output (beads-ei4)
+func (m *MemoryStorage) GetBlockedIssues(ctx context.Context, filter types.WorkFilter) ([]*types.BlockedIssue, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Build set of descendant IDs if parent filter is specified
+	var descendantIDs map[string]bool
+	if filter.ParentID != nil {
+		descendantIDs = m.getAllDescendants(*filter.ParentID)
+	}
+
+	var results []*types.BlockedIssue
+
+	for _, issue := range m.issues {
+		// Only consider non-closed, non-tombstone issues
+		if issue.Status == types.StatusClosed || issue.Status == types.StatusTombstone {
+			continue
+		}
+
+		// Exclude pinned issues (beads-ei4)
+		if issue.Pinned {
+			continue
+		}
+
+		// Parent filtering: only include descendants of specified parent
+		if descendantIDs != nil && !descendantIDs[issue.ID] {
+			continue
+		}
+
+		blockers := m.getOpenBlockers(issue.ID)
+		// Issue is "blocked" if: status is blocked, status is deferred, or has open blockers
+		if issue.Status != types.StatusBlocked && issue.Status != types.StatusDeferred && len(blockers) == 0 {
+			continue
+		}
+
+		issueCopy := *issue
+		if deps, ok := m.dependencies[issue.ID]; ok {
+			issueCopy.Dependencies = deps
+		}
+		if labels, ok := m.labels[issue.ID]; ok {
+			issueCopy.Labels = labels
+		}
+		if comments, ok := m.comments[issue.ID]; ok {
+			issueCopy.Comments = comments
+		}
+
+		results = append(results, &types.BlockedIssue{
+			Issue:          issueCopy,
+			BlockedByCount: len(blockers),
+			BlockedBy:      blockers,
+		})
+	}
+
+	// Match SQLite behavior: order by priority ascending
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Priority != results[j].Priority {
+			return results[i].Priority < results[j].Priority
+		}
+		return results[i].CreatedAt.Before(results[j].CreatedAt)
+	})
+
+	return results, nil
+}
+
+// getAllDescendants returns all descendant IDs of a parent issue recursively
+func (m *MemoryStorage) getAllDescendants(parentID string) map[string]bool {
+	descendants := make(map[string]bool)
+	m.collectDescendants(parentID, descendants)
+	return descendants
+}
+
+// collectDescendants recursively collects all descendants of a parent
+func (m *MemoryStorage) collectDescendants(parentID string, descendants map[string]bool) {
+	for issueID, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.Type == types.DepParentChild && dep.DependsOnID == parentID {
+				if !descendants[issueID] {
+					descendants[issueID] = true
+					m.collectDescendants(issueID, descendants)
+				}
+			}
+		}
+	}
 }
 
 func (m *MemoryStorage) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error) {
@@ -912,6 +1330,58 @@ func (m *MemoryStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 	}
 
 	return stale, nil
+}
+
+// GetNewlyUnblockedByClose returns issues that became unblocked when the given issue was closed.
+// This is used by the --suggest-next flag on bd close (GH#679).
+func (m *MemoryStorage) GetNewlyUnblockedByClose(ctx context.Context, closedIssueID string) ([]*types.Issue, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var unblocked []*types.Issue
+
+	// Find issues that depend on the closed issue
+	for issueID, deps := range m.dependencies {
+		issue, exists := m.issues[issueID]
+		if !exists {
+			continue
+		}
+
+		// Only consider open/in_progress, non-pinned issues
+		if issue.Status != types.StatusOpen && issue.Status != types.StatusInProgress {
+			continue
+		}
+		if issue.Pinned {
+			continue
+		}
+
+		// Check if this issue depended on the closed issue
+		dependedOnClosed := false
+		for _, dep := range deps {
+			if dep.DependsOnID == closedIssueID && dep.Type == types.DepBlocks {
+				dependedOnClosed = true
+				break
+			}
+		}
+
+		if !dependedOnClosed {
+			continue
+		}
+
+		// Check if now unblocked (no remaining open blockers)
+		blockers := m.getOpenBlockers(issueID)
+		if len(blockers) == 0 {
+			issueCopy := *issue
+			unblocked = append(unblocked, &issueCopy)
+		}
+	}
+
+	// Sort by priority ascending
+	sort.Slice(unblocked, func(i, j int) bool {
+		return unblocked[i].Priority < unblocked[j].Priority
+	})
+
+	return unblocked, nil
 }
 
 func (m *MemoryStorage) AddComment(ctx context.Context, issueID, actor, comment string) error {
@@ -972,24 +1442,106 @@ func (m *MemoryStorage) GetStatistics(ctx context.Context) (*types.Statistics, e
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	stats := &types.Statistics{
-		TotalIssues: len(m.issues),
-	}
+	stats := &types.Statistics{}
 
+	// First pass: count by status
 	for _, issue := range m.issues {
 		switch issue.Status {
 		case types.StatusOpen:
 			stats.OpenIssues++
 		case types.StatusInProgress:
 			stats.InProgressIssues++
-		case types.StatusBlocked:
-			stats.BlockedIssues++
 		case types.StatusClosed:
 			stats.ClosedIssues++
+		case types.StatusDeferred:
+			stats.DeferredIssues++
+		case types.StatusTombstone:
+			stats.TombstoneIssues++
+		case types.StatusPinned:
+			stats.PinnedIssues++
 		}
 	}
 
+	// TotalIssues excludes tombstones (matches SQLite behavior)
+	stats.TotalIssues = stats.OpenIssues + stats.InProgressIssues + stats.ClosedIssues + stats.DeferredIssues + stats.PinnedIssues
+
+	// Second pass: calculate blocked and ready issues based on dependencies
+	// An issue is blocked if it has open blockers (uses same logic as GetBlockedIssues)
+	for id, issue := range m.issues {
+		// Only consider non-closed, non-tombstone issues for blocking
+		if issue.Status == types.StatusClosed || issue.Status == types.StatusTombstone {
+			continue
+		}
+
+		blockers := m.getOpenBlockers(id)
+		if len(blockers) > 0 {
+			stats.BlockedIssues++
+		} else if issue.Status == types.StatusOpen {
+			// Ready = open issues with no open blockers
+			stats.ReadyIssues++
+		}
+	}
+
+	// Calculate average lead time (hours from created to closed)
+	var totalLeadTime float64
+	var closedCount int
+	for _, issue := range m.issues {
+		if issue.Status == types.StatusClosed && issue.ClosedAt != nil {
+			leadTime := issue.ClosedAt.Sub(issue.CreatedAt).Hours()
+			totalLeadTime += leadTime
+			closedCount++
+		}
+	}
+	if closedCount > 0 {
+		stats.AverageLeadTime = totalLeadTime / float64(closedCount)
+	}
+
+	// Calculate epics eligible for closure
+	stats.EpicsEligibleForClosure = m.countEpicsEligibleForClosure()
+
 	return stats, nil
+}
+
+// countEpicsEligibleForClosure returns the count of non-closed epics where all children are closed
+func (m *MemoryStorage) countEpicsEligibleForClosure() int {
+	// Build a map of epic -> children using parent-child dependencies
+	epicChildren := make(map[string][]string)
+	for _, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.Type == types.DepParentChild {
+				// dep.IssueID is the child, dep.DependsOnID is the parent
+				epicChildren[dep.DependsOnID] = append(epicChildren[dep.DependsOnID], dep.IssueID)
+			}
+		}
+	}
+
+	count := 0
+	for epicID, children := range epicChildren {
+		epic, exists := m.issues[epicID]
+		if !exists {
+			continue
+		}
+		// Only consider non-closed epics
+		if epic.IssueType != types.TypeEpic || epic.Status == types.StatusClosed {
+			continue
+		}
+		// Check if all children are closed
+		if len(children) == 0 {
+			continue
+		}
+		allClosed := true
+		for _, childID := range children {
+			child, exists := m.issues[childID]
+			if !exists || child.Status != types.StatusClosed {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			count++
+		}
+	}
+	return count
 }
 
 // Dirty tracking
@@ -1003,14 +1555,6 @@ func (m *MemoryStorage) GetDirtyIssues(ctx context.Context) ([]string, error) {
 	}
 
 	return dirtyIDs, nil
-}
-
-func (m *MemoryStorage) ClearDirtyIssues(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.dirty = make(map[string]bool)
-	return nil
 }
 
 func (m *MemoryStorage) ClearDirtyIssuesByID(ctx context.Context, issueIDs []string) error {
@@ -1155,6 +1699,55 @@ func (m *MemoryStorage) Close() error {
 
 func (m *MemoryStorage) Path() string {
 	return m.jsonlPath
+}
+
+// GetMoleculeProgress returns progress stats for a molecule.
+// For memory storage, this iterates through dependencies.
+func (m *MemoryStorage) GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	issue, exists := m.issues[moleculeID]
+	if !exists {
+		return nil, fmt.Errorf("molecule not found: %s", moleculeID)
+	}
+
+	stats := &types.MoleculeProgressStats{
+		MoleculeID:    moleculeID,
+		MoleculeTitle: issue.Title,
+	}
+
+	// Find all parent-child dependencies where moleculeID is the parent
+	for _, deps := range m.dependencies {
+		for _, dep := range deps {
+			if dep.Type == types.DepParentChild && dep.DependsOnID == moleculeID {
+				child, exists := m.issues[dep.IssueID]
+				if !exists {
+					continue
+				}
+				stats.Total++
+				switch child.Status {
+				case types.StatusClosed:
+					stats.Completed++
+					if child.ClosedAt != nil {
+						if stats.FirstClosed == nil || child.ClosedAt.Before(*stats.FirstClosed) {
+							stats.FirstClosed = child.ClosedAt
+						}
+						if stats.LastClosed == nil || child.ClosedAt.After(*stats.LastClosed) {
+							stats.LastClosed = child.ClosedAt
+						}
+					}
+				case types.StatusInProgress:
+					stats.InProgress++
+					if stats.CurrentStepID == "" {
+						stats.CurrentStepID = child.ID
+					}
+				}
+			}
+		}
+	}
+
+	return stats, nil
 }
 
 // UnderlyingDB returns nil for memory storage (no SQL database)

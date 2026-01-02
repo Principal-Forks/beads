@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 )
 
@@ -20,6 +21,14 @@ func ensureTestMode(t *testing.T) {
 	t.Cleanup(func() {
 		os.Unsetenv("BEADS_TEST_MODE")
 	})
+}
+
+// ensureCleanGlobalState resets global state that may have been modified by other tests.
+// Call this at the start of tests that manipulate globals directly.
+func ensureCleanGlobalState(t *testing.T) {
+	t.Helper()
+	// Reset CommandContext so accessor functions fall back to globals
+	resetCommandContext()
 }
 
 // failIfProductionDatabase checks if the database path is in a production directory
@@ -37,34 +46,37 @@ func failIfProductionDatabase(t *testing.T, dbPath string) {
 		return
 	}
 	
-	// Check if database is in a directory that contains .git
-	dir := filepath.Dir(absPath)
-	for {
-		gitPath := filepath.Join(dir, ".git")
-		if _, err := os.Stat(gitPath); err == nil {
-			// Found .git directory - check if this is a test or production database
-			beadsPath := filepath.Join(dir, ".beads")
-			if strings.HasPrefix(absPath, beadsPath) {
-				// Database is in .beads/ directory of a git repository
-				// This is ONLY allowed if we're in a temp directory
-				if !strings.Contains(absPath, os.TempDir()) {
-					t.Fatalf("PRODUCTION DATABASE POLLUTION DETECTED (bd-2c5a):\n"+
-						"  Database: %s\n"+
-						"  Git repo: %s\n"+
-						"  Tests MUST use t.TempDir() or tempfile to create isolated databases.\n"+
-						"  This prevents test issues from polluting the production database.",
-						absPath, dir)
-				}
-			}
-			break
+	// Use worktree-aware git directory detection
+	gitDir, err := git.GetGitDir()
+	if err != nil {
+		// Not a git repository, no pollution risk
+		return
+	}
+	
+	// Check if database is in .beads/ directory of this git repository
+	beadsPath := ""
+	gitDirAbs, err := filepath.Abs(gitDir)
+	if err != nil {
+		t.Logf("Warning: Could not get absolute path for git dir %s: %v", gitDir, err)
+		return
+	}
+	
+	// The .beads directory should be at the root of the git repository
+	// For worktrees, gitDir points to the main repo's .git directory
+	repoRoot := filepath.Dir(gitDirAbs)
+	beadsPath = filepath.Join(repoRoot, ".beads")
+	
+	if strings.HasPrefix(absPath, beadsPath) {
+		// Database is in .beads/ directory of a git repository
+		// This is ONLY allowed if we're in a temp directory
+		if !strings.Contains(absPath, os.TempDir()) {
+			t.Fatalf("PRODUCTION DATABASE POLLUTION DETECTED (bd-2c5a):\n"+
+				"  Database: %s\n"+
+				"  Git repo: %s\n"+
+				"  Tests MUST use t.TempDir() or tempfile to create isolated databases.\n"+
+				"  This prevents test issues from polluting the production database.",
+				absPath, repoRoot)
 		}
-		
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			// Reached filesystem root
-			break
-		}
-		dir = parent
 	}
 }
 

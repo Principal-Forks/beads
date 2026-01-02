@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/internal/config"
 )
 
 var (
@@ -20,8 +21,9 @@ var (
 )
 
 var primeCmd = &cobra.Command{
-	Use:   "prime",
-	Short: "Output AI-optimized workflow context",
+	Use:     "prime",
+	GroupID: "setup",
+	Short:   "Output AI-optimized workflow context",
 	Long: `Output essential Beads workflow context in AI-optimized markdown format.
 
 Automatically detects if MCP server is active and adapts output:
@@ -29,7 +31,12 @@ Automatically detects if MCP server is active and adapts output:
 - CLI mode: Full command reference (~1-2k tokens)
 
 Designed for Claude Code hooks (SessionStart, PreCompact) to prevent
-agents from forgetting bd workflow after context compaction.`,
+agents from forgetting bd workflow after context compaction.
+
+Config options:
+- no-git-ops: When true, outputs stealth mode (no git commands in session close protocol).
+  Set via: bd config set no-git-ops true
+  Useful when you want to control when commits happen manually.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Find .beads/ directory (supports both database and JSONL-only mode)
 		beadsDir := beads.FindBeadsDir()
@@ -49,8 +56,12 @@ agents from forgetting bd workflow after context compaction.`,
 			mcpMode = true
 		}
 
+		// Check for stealth mode: flag OR config (GH#593)
+		// This allows users to disable git ops in session close protocol via config
+		stealthMode := primeStealthMode || config.GetBool("no-git-ops")
+
 		// Output workflow context (adaptive based on MCP and stealth mode)
-		if err := outputPrimeContext(os.Stdout, mcpMode, primeStealthMode); err != nil {
+		if err := outputPrimeContext(os.Stdout, mcpMode, stealthMode); err != nil {
 			// Suppress all errors - silent exit with success
 			// Never write to stderr (breaks Windows compatibility)
 			os.Exit(0)
@@ -115,6 +126,22 @@ var isEphemeralBranch = func() bool {
 	return err != nil
 }
 
+// getRedirectNotice returns a notice string if beads is redirected
+func getRedirectNotice(verbose bool) string {
+	redirectInfo := beads.GetRedirectInfo()
+	if !redirectInfo.IsRedirected {
+		return ""
+	}
+
+	if verbose {
+		return fmt.Sprintf(`> ⚠️ **Redirected**: Local .beads → %s
+> You share issues with other clones using this redirect.
+
+`, redirectInfo.TargetDir)
+	}
+	return fmt.Sprintf("**Note**: Beads redirected to %s (shared with other clones)\n\n", redirectInfo.TargetDir)
+}
+
 // outputPrimeContext outputs workflow context in markdown format
 func outputPrimeContext(w io.Writer, mcpMode bool, stealthMode bool) error {
 	if mcpMode {
@@ -126,6 +153,7 @@ func outputPrimeContext(w io.Writer, mcpMode bool, stealthMode bool) error {
 // outputMCPContext outputs minimal context for MCP users
 func outputMCPContext(w io.Writer, stealthMode bool) error {
 	ephemeral := isEphemeralBranch()
+	noPush := config.GetBool("no-push")
 
 	var closeProtocol string
 	if stealthMode {
@@ -133,19 +161,24 @@ func outputMCPContext(w io.Writer, stealthMode bool) error {
 		closeProtocol = "Before saying \"done\": bd sync --flush-only"
 	} else if ephemeral {
 		closeProtocol = "Before saying \"done\": git status → git add → bd sync --from-main → git commit (no push - ephemeral branch)"
+	} else if noPush {
+		closeProtocol = "Before saying \"done\": git status → git add → bd sync → git commit (push disabled - run git push manually)"
 	} else {
 		closeProtocol = "Before saying \"done\": git status → git add → bd sync → git commit → bd sync → git push"
 	}
 
+	redirectNotice := getRedirectNotice(false)
+
 	context := `# Beads Issue Tracker Active
 
-# 🚨 SESSION CLOSE PROTOCOL 🚨
+` + redirectNotice + `# 🚨 SESSION CLOSE PROTOCOL 🚨
 
 ` + closeProtocol + `
 
 ## Core Rules
-- Track ALL work in beads (no TodoWrite tool, no markdown TODOs)
-- Use bd MCP tools (mcp__plugin_beads_beads__*), not TodoWrite or markdown
+- Track strategic work in beads (multi-session, dependencies, discovered work)
+- TodoWrite is fine for simple single-session linear tasks
+- When in doubt, prefer bd—persistence you don't need beats lost context
 
 Start: Check ` + "`ready`" + ` tool for available work.
 `
@@ -156,6 +189,7 @@ Start: Check ` + "`ready`" + ` tool for available work.
 // outputCLIContext outputs full CLI reference for non-MCP users
 func outputCLIContext(w io.Writer, stealthMode bool) error {
 	ephemeral := isEphemeralBranch()
+	noPush := config.GetBool("no-push")
 
 	var closeProtocol string
 	var closeNote string
@@ -188,6 +222,22 @@ bd sync --from-main         # Pull latest beads from main
 git add . && git commit -m "..."  # Commit your changes
 # Merge to main when ready (local merge, not push)
 ` + "```"
+	} else if noPush {
+		closeProtocol = `[ ] 1. git status              (check what changed)
+[ ] 2. git add <files>         (stage code changes)
+[ ] 3. bd sync                 (commit beads changes)
+[ ] 4. git commit -m "..."     (commit code)
+[ ] 5. bd sync                 (commit any new beads changes)`
+		closeNote = "**Note:** Push disabled via config. Run `git push` manually when ready."
+		syncSection = `### Sync & Collaboration
+- ` + "`bd sync`" + ` - Sync with git remote (run at session end)
+- ` + "`bd sync --status`" + ` - Check sync status without syncing`
+		completingWorkflow = `**Completing work:**
+` + "```bash" + `
+bd close <id1> <id2> ...    # Close all completed issues at once
+bd sync                     # Sync beads (push disabled)
+# git push                  # Run manually when ready
+` + "```"
 	} else {
 		closeProtocol = `[ ] 1. git status              (check what changed)
 [ ] 2. git add <files>         (stage code changes)
@@ -206,12 +256,14 @@ bd sync                     # Push to remote
 ` + "```"
 	}
 
+	redirectNotice := getRedirectNotice(true)
+
 	context := `# Beads Workflow Context
 
 > **Context Recovery**: Run ` + "`bd prime`" + ` after compaction, clear, or new session
 > Hooks auto-call this in Claude Code when .beads/ detected
 
-# 🚨 SESSION CLOSE PROTOCOL 🚨
+` + redirectNotice + `# 🚨 SESSION CLOSE PROTOCOL 🚨
 
 **CRITICAL**: Before saying "done" or "complete", you MUST run this checklist:
 
@@ -222,8 +274,9 @@ bd sync                     # Push to remote
 ` + closeNote + `
 
 ## Core Rules
-- Track ALL work in beads (no TodoWrite tool, no markdown TODOs)
-- Use ` + "`bd create`" + ` to create issues, not TodoWrite tool
+- Track strategic work in beads (multi-session, dependencies, discovered work)
+- Use ` + "`bd create`" + ` for issues, TodoWrite for simple single-session execution
+- When in doubt, prefer bd—persistence you don't need beats lost context
 - Git workflow: hooks auto-sync, run ` + "`bd sync`" + ` at session end
 - Session management: check ` + "`bd ready`" + ` for available work
 
@@ -236,7 +289,8 @@ bd sync                     # Push to remote
 - ` + "`bd show <id>`" + ` - Detailed issue view with dependencies
 
 ### Creating & Updating
-- ` + "`bd create --title=\"...\" --type=task|bug|feature`" + ` - New issue
+- ` + "`bd create --title=\"...\" --type=task|bug|feature --priority=2`" + ` - New issue
+  - Priority: 0-4 or P0-P4 (0=critical, 2=medium, 4=backlog). NOT "high"/"medium"/"low"
 - ` + "`bd update <id> --status=in_progress`" + ` - Claim work
 - ` + "`bd update <id> --assignee=username`" + ` - Assign to someone
 - ` + "`bd close <id>`" + ` - Mark complete

@@ -6,33 +6,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
 var initCmd = &cobra.Command{
-	Use:   "init",
-	Short: "Initialize bd in the current directory",
+	Use:     "init",
+	GroupID: "setup",
+	Short:   "Initialize bd in the current directory",
 	Long: `Initialize bd in the current directory by creating a .beads/ directory
 and database file. Optionally specify a custom issue prefix.
 
 With --no-db: creates .beads/ directory and issues.jsonl file instead of SQLite database.
 
-With --stealth: configures global git settings for invisible beads usage:
-  • Global gitignore to prevent beads files from being committed
+With --from-jsonl: imports from the current .beads/issues.jsonl file on disk instead
+of scanning git history. Use this after manual JSONL cleanup (e.g., bd compact --purge-tombstones)
+to prevent deleted issues from being resurrected during re-initialization.
+
+With --stealth: configures per-repository git settings for invisible beads usage:
+  • .git/info/exclude to prevent beads files from being committed
   • Claude Code settings with bd onboard instruction
   Perfect for personal use without affecting repo collaborators.`,
 	Run: func(cmd *cobra.Command, _ []string) {
@@ -45,6 +49,7 @@ With --stealth: configures global git settings for invisible beads usage:
 		skipMergeDriver, _ := cmd.Flags().GetBool("skip-merge-driver")
 		skipHooks, _ := cmd.Flags().GetBool("skip-hooks")
 		force, _ := cmd.Flags().GetBool("force")
+		fromJSONL, _ := cmd.Flags().GetBool("from-jsonl")
 
 		// Initialize config (PersistentPreRun doesn't run for init command)
 		if err := config.Initialize(); err != nil {
@@ -52,7 +57,7 @@ With --stealth: configures global git settings for invisible beads usage:
 			// Non-fatal - continue with defaults
 		}
 
-		// Safety guard: check for existing JSONL with issues (bd-emg)
+		// Safety guard: check for existing JSONL with issues
 		// This prevents accidental re-initialization in fresh clones
 		if !force {
 			if err := checkExistingBeadsData(prefix); err != nil {
@@ -127,12 +132,33 @@ With --stealth: configures global git settings for invisible beads usage:
 			os.Exit(1)
 		}
 
-		// Determine if we should create .beads/ directory in CWD
-		// Only create it if the database will be stored there
+		// Determine if we should create .beads/ directory in CWD or main repo root
+		// For worktrees, .beads should always be in the main repository root
 		cwd, err := os.Getwd()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to get current directory: %v\n", err)
 			os.Exit(1)
+		}
+
+		// Check if we're in a git worktree
+		// Guard with isGitRepo() check first - on Windows, git commands may hang
+		// when run outside a git repository (GH#727)
+		isWorktree := false
+		if isGitRepo() {
+			isWorktree = git.IsWorktree()
+		}
+		var beadsDir string
+		if isWorktree {
+			// For worktrees, .beads should be in the main repository root
+			mainRepoRoot, err := git.GetMainRepoRoot()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to get main repository root: %v\n", err)
+				os.Exit(1)
+			}
+			beadsDir = filepath.Join(mainRepoRoot, ".beads")
+		} else {
+			// For regular repos, use current directory
+			beadsDir = filepath.Join(cwd, ".beads")
 		}
 
 		// Prevent nested .beads directories
@@ -145,24 +171,23 @@ With --stealth: configures global git settings for invisible beads usage:
 			os.Exit(1)
 		}
 
-		localBeadsDir := filepath.Join(cwd, ".beads")
 		initDBDir := filepath.Dir(initDBPath)
 
 		// Convert both to absolute paths for comparison
-		localBeadsDirAbs, err := filepath.Abs(localBeadsDir)
+		beadsDirAbs, err := filepath.Abs(beadsDir)
 		if err != nil {
-			localBeadsDirAbs = filepath.Clean(localBeadsDir)
+			beadsDirAbs = filepath.Clean(beadsDir)
 		}
 		initDBDirAbs, err := filepath.Abs(initDBDir)
 		if err != nil {
 			initDBDirAbs = filepath.Clean(initDBDir)
 		}
 
-		useLocalBeads := filepath.Clean(initDBDirAbs) == filepath.Clean(localBeadsDirAbs)
+		useLocalBeads := filepath.Clean(initDBDirAbs) == filepath.Clean(beadsDirAbs)
 
 		if useLocalBeads {
 			// Create .beads directory
-			if err := os.MkdirAll(localBeadsDir, 0750); err != nil {
+			if err := os.MkdirAll(beadsDir, 0750); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to create .beads directory: %v\n", err)
 				os.Exit(1)
 			}
@@ -170,7 +195,7 @@ With --stealth: configures global git settings for invisible beads usage:
 			// Handle --no-db mode: create issues.jsonl file instead of database
 			if noDb {
 				// Create empty issues.jsonl file
-				jsonlPath := filepath.Join(localBeadsDir, "issues.jsonl")
+				jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 				if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
 					// nolint:gosec // G306: JSONL file needs to be readable by other tools
 					if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
@@ -179,44 +204,61 @@ With --stealth: configures global git settings for invisible beads usage:
 					}
 				}
 
+				// Create empty interactions.jsonl file (append-only agent audit log)
+				interactionsPath := filepath.Join(beadsDir, "interactions.jsonl")
+				if _, err := os.Stat(interactionsPath); os.IsNotExist(err) {
+					// nolint:gosec // G306: JSONL file needs to be readable by other tools
+					if err := os.WriteFile(interactionsPath, []byte{}, 0644); err != nil {
+						fmt.Fprintf(os.Stderr, "Error: failed to create interactions.jsonl: %v\n", err)
+						os.Exit(1)
+					}
+				}
+
 				// Create metadata.json for --no-db mode
 				cfg := configfile.DefaultConfig()
-				if err := cfg.Save(localBeadsDir); err != nil {
+				if err := cfg.Save(beadsDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 					// Non-fatal - continue anyway
 				}
 
 				// Create config.yaml with no-db: true
-				if err := createConfigYaml(localBeadsDir, true); err != nil {
+				if err := createConfigYaml(beadsDir, true); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to create config.yaml: %v\n", err)
 					// Non-fatal - continue anyway
 				}
 
 				// Create README.md
-				if err := createReadme(localBeadsDir); err != nil {
+				if err := createReadme(beadsDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to create README.md: %v\n", err)
 					// Non-fatal - continue anyway
 				}
 
 				if !quiet {
-					green := color.New(color.FgGreen).SprintFunc()
-					cyan := color.New(color.FgCyan).SprintFunc()
-
-					fmt.Printf("\n%s bd initialized successfully in --no-db mode!\n\n", green("✓"))
-					fmt.Printf("  Mode: %s\n", cyan("no-db (JSONL-only)"))
-					fmt.Printf("  Issues file: %s\n", cyan(jsonlPath))
-					fmt.Printf("  Issue prefix: %s\n", cyan(prefix))
-					fmt.Printf("  Issues will be named: %s\n\n", cyan(prefix+"-1, "+prefix+"-2, ..."))
-					fmt.Printf("Run %s to get started.\n\n", cyan("bd --no-db quickstart"))
+					fmt.Printf("\n%s bd initialized successfully in --no-db mode!\n\n", ui.RenderPass("✓"))
+					fmt.Printf("  Mode: %s\n", ui.RenderAccent("no-db (JSONL-only)"))
+					fmt.Printf("  Issues file: %s\n", ui.RenderAccent(jsonlPath))
+					fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(prefix))
+					fmt.Printf("  Issues will be named: %s\n\n", ui.RenderAccent(prefix+"-<hash> (e.g., "+prefix+"-a3f2dd)"))
+					fmt.Printf("Run %s to get started.\n\n", ui.RenderAccent("bd --no-db quickstart"))
 				}
 				return
 			}
 
 			// Create/update .gitignore in .beads directory (idempotent - always update to latest)
-			gitignorePath := filepath.Join(localBeadsDir, ".gitignore")
+			gitignorePath := filepath.Join(beadsDir, ".gitignore")
 			if err := os.WriteFile(gitignorePath, []byte(doctor.GitignoreTemplate), 0600); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create/update .gitignore: %v\n", err)
 				// Non-fatal - continue anyway
+			}
+
+			// Ensure interactions.jsonl exists (append-only agent audit log)
+			interactionsPath := filepath.Join(beadsDir, "interactions.jsonl")
+			if _, err := os.Stat(interactionsPath); os.IsNotExist(err) {
+				// nolint:gosec // G306: JSONL file needs to be readable by other tools
+				if err := os.WriteFile(interactionsPath, []byte{}, 0644); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to create interactions.jsonl: %v\n", err)
+					// Non-fatal - continue anyway
+				}
 			}
 		}
 
@@ -245,16 +287,13 @@ With --stealth: configures global git settings for invisible beads usage:
 			os.Exit(1)
 		}
 
-		// Set sync.branch: use explicit --branch flag, or auto-detect current branch
-		// This ensures bd sync --status works after bd init (bd-flil)
-		if branch == "" && isGitRepo() {
-			// Auto-detect current branch if not specified
-			currentBranch, err := getGitBranch()
-			if err == nil && currentBranch != "" {
-				branch = currentBranch
-			}
-		}
-
+		// Set sync.branch only if explicitly specified via --branch flag
+		// GH#807: Do NOT auto-detect current branch - if sync.branch is set to main/master,
+		// the worktree created by bd sync will check out main, preventing the user from
+		// checking out main in their working directory (git error: "'main' is already checked out")
+		//
+		// When --branch is not specified, bd sync will commit directly to the current branch
+		// (the original behavior before sync branch feature)
 		if branch != "" {
 			if err := syncbranch.Set(ctx, store, branch); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to set sync branch: %v\n", err)
@@ -308,7 +347,7 @@ With --stealth: configures global git settings for invisible beads usage:
 		// Create or preserve metadata.json for database metadata (bd-zai fix)
 		if useLocalBeads {
 			// First, check if metadata.json already exists
-			existingCfg, err := configfile.Load(localBeadsDir)
+			existingCfg, err := configfile.Load(beadsDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to load existing metadata.json: %v\n", err)
 			}
@@ -321,47 +360,67 @@ With --stealth: configures global git settings for invisible beads usage:
 				// Create new config, detecting JSONL filename from existing files
 				cfg = configfile.DefaultConfig()
 				// Check if beads.jsonl exists but issues.jsonl doesn't (legacy)
-				issuesPath := filepath.Join(localBeadsDir, "issues.jsonl")
-				beadsPath := filepath.Join(localBeadsDir, "beads.jsonl")
+				issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+				beadsPath := filepath.Join(beadsDir, "beads.jsonl")
 				if _, err := os.Stat(beadsPath); err == nil {
 					if _, err := os.Stat(issuesPath); os.IsNotExist(err) {
 						cfg.JSONLExport = "beads.jsonl" // Legacy filename
 					}
 				}
 			}
-			if err := cfg.Save(localBeadsDir); err != nil {
+			if err := cfg.Save(beadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 				// Non-fatal - continue anyway
 			}
 
 			// Create config.yaml template
-			if err := createConfigYaml(localBeadsDir, false); err != nil {
+			if err := createConfigYaml(beadsDir, false); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create config.yaml: %v\n", err)
 				// Non-fatal - continue anyway
 			}
 
 			// Create README.md
-			if err := createReadme(localBeadsDir); err != nil {
+			if err := createReadme(beadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create README.md: %v\n", err)
 				// Non-fatal - continue anyway
 			}
 		}
 
 		// Check if git has existing issues to import (fresh clone scenario)
-		issueCount, jsonlPath, gitRef := checkGitForIssues()
-		if issueCount > 0 {
-			if !quiet {
-				fmt.Fprintf(os.Stderr, "\n✓ Database initialized. Found %d issues in git, importing...\n", issueCount)
-			}
-
-			if err := importFromGit(ctx, initDBPath, store, jsonlPath, gitRef); err != nil {
-				if !quiet {
-					fmt.Fprintf(os.Stderr, "Warning: auto-import failed: %v\n", err)
-					fmt.Fprintf(os.Stderr, "Try manually: git show %s:%s | bd import -i /dev/stdin\n", gitRef, jsonlPath)
+		// With --from-jsonl: import from local file instead of git history
+		if fromJSONL {
+			// Import from current working tree's JSONL file
+			localJSONLPath := filepath.Join(beadsDir, "issues.jsonl")
+			if _, err := os.Stat(localJSONLPath); err == nil {
+				issueCount, err := importFromLocalJSONL(ctx, initDBPath, store, localJSONLPath)
+				if err != nil {
+					if !quiet {
+						fmt.Fprintf(os.Stderr, "Warning: import from local JSONL failed: %v\n", err)
+					}
+					// Non-fatal - continue with empty database
+				} else if !quiet && issueCount > 0 {
+					fmt.Fprintf(os.Stderr, "✓ Imported %d issues from local %s\n\n", issueCount, localJSONLPath)
 				}
-				// Non-fatal - continue with empty database
 			} else if !quiet {
-				fmt.Fprintf(os.Stderr, "✓ Successfully imported %d issues from git.\n\n", issueCount)
+				fmt.Fprintf(os.Stderr, "Warning: --from-jsonl specified but %s not found\n", localJSONLPath)
+			}
+		} else {
+			// Default: import from git history
+			issueCount, jsonlPath, gitRef := checkGitForIssues()
+			if issueCount > 0 {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "\n✓ Database initialized. Found %d issues in git, importing...\n", issueCount)
+				}
+
+				if err := importFromGit(ctx, initDBPath, store, jsonlPath, gitRef); err != nil {
+					if !quiet {
+						fmt.Fprintf(os.Stderr, "Warning: auto-import failed: %v\n", err)
+						fmt.Fprintf(os.Stderr, "Try manually: git show %s:%s | bd import -i /dev/stdin\n", gitRef, jsonlPath)
+					}
+					// Non-fatal - continue with empty database
+				} else if !quiet {
+					fmt.Fprintf(os.Stderr, "✓ Successfully imported %d issues from git.\n\n", issueCount)
+				}
 			}
 		}
 
@@ -387,13 +446,30 @@ With --stealth: configures global git settings for invisible beads usage:
 			fmt.Fprintf(os.Stderr, "Warning: failed to close database: %v\n", err)
 		}
 
+		// Fork detection: offer to configure .git/info/exclude (GH#742)
+		setupExclude, _ := cmd.Flags().GetBool("setup-exclude")
+		if setupExclude {
+			// Manual flag - always configure
+			if err := setupForkExclude(!quiet); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to configure git exclude: %v\n", err)
+			}
+		} else if !stealth && isGitRepo() {
+			// Auto-detect fork and prompt (skip if stealth - it handles exclude already)
+			if isFork, upstreamURL := detectForkSetup(); isFork {
+				if promptForkExclude(upstreamURL, quiet) {
+					if err := setupForkExclude(!quiet); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to configure git exclude: %v\n", err)
+					}
+				}
+			}
+		}
+
 		// Check if we're in a git repo and hooks aren't installed
 		// Install by default unless --skip-hooks is passed
 		if !skipHooks && isGitRepo() && !hooksInstalled() {
 			if err := installGitHooks(); err != nil && !quiet {
-				yellow := color.New(color.FgYellow).SprintFunc()
-				fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks: %v\n", yellow("⚠"), err)
-				fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", color.New(color.FgCyan).Sprint("bd doctor --fix"))
+				fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks: %v\n", ui.RenderWarn("⚠"), err)
+				fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd doctor --fix"))
 			}
 		}
 
@@ -401,10 +477,15 @@ With --stealth: configures global git settings for invisible beads usage:
 		// Install by default unless --skip-merge-driver is passed
 		if !skipMergeDriver && isGitRepo() && !mergeDriverInstalled() {
 			if err := installMergeDriver(); err != nil && !quiet {
-				yellow := color.New(color.FgYellow).SprintFunc()
-				fmt.Fprintf(os.Stderr, "\n%s Failed to install merge driver: %v\n", yellow("⚠"), err)
-				fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", color.New(color.FgCyan).Sprint("bd doctor --fix"))
+				fmt.Fprintf(os.Stderr, "\n%s Failed to install merge driver: %v\n", ui.RenderWarn("⚠"), err)
+				fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd doctor --fix"))
 			}
+		}
+
+		// Add "landing the plane" instructions to AGENTS.md and @AGENTS.md
+		// Skip in stealth mode (user wants invisible setup) and quiet mode (suppress all output)
+		if !stealth {
+			addLandingThePlaneInstructions(!quiet)
 		}
 
 		// Skip output if quiet mode
@@ -412,16 +493,13 @@ With --stealth: configures global git settings for invisible beads usage:
 			return
 		}
 
-		green := color.New(color.FgGreen).SprintFunc()
-		cyan := color.New(color.FgCyan).SprintFunc()
+		fmt.Printf("\n%s bd initialized successfully!\n\n", ui.RenderPass("✓"))
+		fmt.Printf("  Database: %s\n", ui.RenderAccent(initDBPath))
+		fmt.Printf("  Issue prefix: %s\n", ui.RenderAccent(prefix))
+		fmt.Printf("  Issues will be named: %s\n\n", ui.RenderAccent(prefix+"-<hash> (e.g., "+prefix+"-a3f2dd)"))
+		fmt.Printf("Run %s to get started.\n\n", ui.RenderAccent("bd quickstart"))
 
-		fmt.Printf("\n%s bd initialized successfully!\n\n", green("✓"))
-		fmt.Printf("  Database: %s\n", cyan(initDBPath))
-		fmt.Printf("  Issue prefix: %s\n", cyan(prefix))
-		fmt.Printf("  Issues will be named: %s\n\n", cyan(prefix+"-1, "+prefix+"-2, ..."))
-		fmt.Printf("Run %s to get started.\n\n", cyan("bd quickstart"))
-
-		// Run bd doctor diagnostics to catch setup issues early (bd-zwtq)
+		// Run bd doctor diagnostics to catch setup issues early
 		doctorResult := runDiagnostics(cwd)
 		// Check if there are any warnings or errors (not just critical failures)
 		hasIssues := false
@@ -432,15 +510,14 @@ With --stealth: configures global git settings for invisible beads usage:
 			}
 		}
 		if hasIssues {
-			yellow := color.New(color.FgYellow).SprintFunc()
-			fmt.Printf("%s Setup incomplete. Some issues were detected:\n", yellow("⚠"))
+			fmt.Printf("%s Setup incomplete. Some issues were detected:\n", ui.RenderWarn("⚠"))
 			// Show just the warnings/errors, not all checks
 			for _, check := range doctorResult.Checks {
 				if check.Status != statusOK {
 					fmt.Printf("  • %s: %s\n", check.Name, check.Message)
 				}
 			}
-			fmt.Printf("\nRun %s to see details and fix these issues.\n\n", cyan("bd doctor --fix"))
+			fmt.Printf("\nRun %s to see details and fix these issues.\n\n", ui.RenderAccent("bd doctor --fix"))
 		}
 	},
 }
@@ -452,478 +529,12 @@ func init() {
 	initCmd.Flags().Bool("contributor", false, "Run OSS contributor setup wizard")
 	initCmd.Flags().Bool("team", false, "Run team workflow setup wizard")
 	initCmd.Flags().Bool("stealth", false, "Enable stealth mode: global gitattributes and gitignore, no local repo tracking")
+	initCmd.Flags().Bool("setup-exclude", false, "Configure .git/info/exclude to keep beads files local (for forks)")
 	initCmd.Flags().Bool("skip-hooks", false, "Skip git hooks installation")
 	initCmd.Flags().Bool("skip-merge-driver", false, "Skip git merge driver setup")
 	initCmd.Flags().Bool("force", false, "Force re-initialization even if JSONL already has issues (may cause data loss)")
+	initCmd.Flags().Bool("from-jsonl", false, "Import from current .beads/issues.jsonl file instead of git history (preserves manual cleanups)")
 	rootCmd.AddCommand(initCmd)
-}
-
-// hooksInstalled checks if bd git hooks are installed
-func hooksInstalled() bool {
-	gitDir, err := getGitDir()
-	if err != nil {
-		return false
-	}
-	preCommit := filepath.Join(gitDir, "hooks", "pre-commit")
-	postMerge := filepath.Join(gitDir, "hooks", "post-merge")
-
-	// Check if both hooks exist
-	_, err1 := os.Stat(preCommit)
-	_, err2 := os.Stat(postMerge)
-
-	if err1 != nil || err2 != nil {
-		return false
-	}
-
-	// Verify they're bd hooks by checking for signature comment
-	// #nosec G304 - controlled path from git directory
-	preCommitContent, err := os.ReadFile(preCommit)
-	if err != nil || !strings.Contains(string(preCommitContent), "bd (beads) pre-commit hook") {
-		return false
-	}
-
-	// #nosec G304 - controlled path from git directory
-	postMergeContent, err := os.ReadFile(postMerge)
-	if err != nil || !strings.Contains(string(postMergeContent), "bd (beads) post-merge hook") {
-		return false
-	}
-
-	// Verify hooks are executable
-	preCommitInfo, err := os.Stat(preCommit)
-	if err != nil {
-		return false
-	}
-	if preCommitInfo.Mode().Perm()&0111 == 0 {
-		return false // Not executable
-	}
-
-	postMergeInfo, err := os.Stat(postMerge)
-	if err != nil {
-		return false
-	}
-	if postMergeInfo.Mode().Perm()&0111 == 0 {
-		return false // Not executable
-	}
-
-	return true
-}
-
-// hookInfo contains information about an existing hook
-type hookInfo struct {
-	name        string
-	path        string
-	exists      bool
-	isBdHook    bool
-	isPreCommit bool
-	content     string
-}
-
-// detectExistingHooks scans for existing git hooks
-func detectExistingHooks() []hookInfo {
-	gitDir, err := getGitDir()
-	if err != nil {
-		return nil
-	}
-	hooksDir := filepath.Join(gitDir, "hooks")
-	hooks := []hookInfo{
-		{name: "pre-commit", path: filepath.Join(hooksDir, "pre-commit")},
-		{name: "post-merge", path: filepath.Join(hooksDir, "post-merge")},
-		{name: "pre-push", path: filepath.Join(hooksDir, "pre-push")},
-	}
-
-	for i := range hooks {
-		content, err := os.ReadFile(hooks[i].path)
-		if err == nil {
-			hooks[i].exists = true
-			hooks[i].content = string(content)
-			hooks[i].isBdHook = strings.Contains(hooks[i].content, "bd (beads)")
-			// Only detect pre-commit framework if not a bd hook
-			if !hooks[i].isBdHook {
-				hooks[i].isPreCommit = strings.Contains(hooks[i].content, "pre-commit run") ||
-					strings.Contains(hooks[i].content, ".pre-commit-config")
-			}
-		}
-	}
-
-	return hooks
-}
-
-// promptHookAction asks user what to do with existing hooks
-func promptHookAction(existingHooks []hookInfo) string {
-	yellow := color.New(color.FgYellow).SprintFunc()
-
-	fmt.Printf("\n%s Found existing git hooks:\n", yellow("⚠"))
-	for _, hook := range existingHooks {
-		if hook.exists && !hook.isBdHook {
-			hookType := "custom script"
-			if hook.isPreCommit {
-				hookType = "pre-commit framework"
-			}
-			fmt.Printf("  - %s (%s)\n", hook.name, hookType)
-		}
-	}
-
-	fmt.Printf("\nHow should bd proceed?\n")
-	fmt.Printf("  [1] Chain with existing hooks (recommended)\n")
-	fmt.Printf("  [2] Overwrite existing hooks\n")
-	fmt.Printf("  [3] Skip git hooks installation\n")
-	fmt.Printf("Choice [1-3]: ")
-
-	var response string
-	_, _ = fmt.Scanln(&response)
-	response = strings.TrimSpace(response)
-
-	return response
-}
-
-// installGitHooks installs git hooks inline (no external dependencies)
-func installGitHooks() error {
-	gitDir, err := getGitDir()
-	if err != nil {
-		return err
-	}
-	hooksDir := filepath.Join(gitDir, "hooks")
-
-	// Ensure hooks directory exists
-	if err := os.MkdirAll(hooksDir, 0750); err != nil {
-		return fmt.Errorf("failed to create hooks directory: %w", err)
-	}
-
-	// Detect existing hooks
-	existingHooks := detectExistingHooks()
-
-	// Check if any non-bd hooks exist
-	hasExistingHooks := false
-	for _, hook := range existingHooks {
-		if hook.exists && !hook.isBdHook {
-			hasExistingHooks = true
-			break
-		}
-	}
-
-	// Determine installation mode
-	chainHooks := false
-	if hasExistingHooks {
-		cyan := color.New(color.FgCyan).SprintFunc()
-		choice := promptHookAction(existingHooks)
-		switch choice {
-		case "1", "":
-			chainHooks = true
-		case "2":
-			// Overwrite mode - backup existing hooks
-			for _, hook := range existingHooks {
-				if hook.exists && !hook.isBdHook {
-					timestamp := time.Now().Format("20060102-150405")
-					backup := hook.path + ".backup-" + timestamp
-					if err := os.Rename(hook.path, backup); err != nil {
-						return fmt.Errorf("failed to backup %s: %w", hook.name, err)
-					}
-					fmt.Printf("  Backed up %s to %s\n", hook.name, filepath.Base(backup))
-				}
-			}
-		case "3":
-			fmt.Printf("Skipping git hooks installation.\n")
-			fmt.Printf("You can install manually later with: %s\n", cyan("./examples/git-hooks/install.sh"))
-			return nil
-		default:
-			return fmt.Errorf("invalid choice: %s", choice)
-		}
-	}
-
-	// pre-commit hook
-	preCommitPath := filepath.Join(hooksDir, "pre-commit")
-	var preCommitContent string
-
-	if chainHooks {
-		// Find existing pre-commit hook
-		var existingPreCommit string
-		for _, hook := range existingHooks {
-			if hook.name == "pre-commit" && hook.exists && !hook.isBdHook {
-				// Move to .pre-commit-old
-				oldPath := hook.path + ".old"
-				if err := os.Rename(hook.path, oldPath); err != nil {
-					return fmt.Errorf("failed to move existing pre-commit: %w", err)
-				}
-				existingPreCommit = oldPath
-				break
-			}
-		}
-
-		preCommitContent = `#!/bin/sh
-#
-# bd (beads) pre-commit hook (chained)
-#
-# This hook chains bd functionality with your existing pre-commit hook.
-
-# Run existing hook first
-if [ -x "` + existingPreCommit + `" ]; then
-    "` + existingPreCommit + `" "$@"
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -ne 0 ]; then
-        exit $EXIT_CODE
-    fi
-fi
-
-# Check if bd is available
-if ! command -v bd >/dev/null 2>&1; then
-    echo "Warning: bd command not found, skipping pre-commit flush" >&2
-    exit 0
-fi
-
-# Check if we're in a bd workspace
-if [ ! -d .beads ]; then
-    exit 0
-fi
-
-# Flush pending changes to JSONL
-if ! bd sync --flush-only >/dev/null 2>&1; then
-    echo "Error: Failed to flush bd changes to JSONL" >&2
-    echo "Run 'bd sync --flush-only' manually to diagnose" >&2
-    exit 1
-fi
-
-# If the JSONL file was modified, stage it
-if [ -f .beads/issues.jsonl ]; then
-    git add .beads/issues.jsonl 2>/dev/null || true
-fi
-
-exit 0
-`
-	} else {
-		preCommitContent = `#!/bin/sh
-#
-# bd (beads) pre-commit hook
-#
-# This hook ensures that any pending bd issue changes are flushed to
-# .beads/issues.jsonl before the commit is created, preventing the
-# race condition where daemon auto-flush fires after the commit.
-
-# Check if bd is available
-if ! command -v bd >/dev/null 2>&1; then
-    echo "Warning: bd command not found, skipping pre-commit flush" >&2
-    exit 0
-fi
-
-# Check if we're in a bd workspace
-if [ ! -d .beads ]; then
-    # Not a bd workspace, nothing to do
-    exit 0
-fi
-
-# Flush pending changes to JSONL
-# Use --flush-only to skip git operations (we're already in a git hook)
-# Suppress output unless there's an error
-if ! bd sync --flush-only >/dev/null 2>&1; then
-    echo "Error: Failed to flush bd changes to JSONL" >&2
-    echo "Run 'bd sync --flush-only' manually to diagnose" >&2
-    exit 1
-fi
-
-# If the JSONL file was modified, stage it
-if [ -f .beads/issues.jsonl ]; then
-    git add .beads/issues.jsonl 2>/dev/null || true
-fi
-
-exit 0
-`
-	}
-
-	// post-merge hook
-	postMergePath := filepath.Join(hooksDir, "post-merge")
-	var postMergeContent string
-
-	if chainHooks {
-		// Find existing post-merge hook
-		var existingPostMerge string
-		for _, hook := range existingHooks {
-			if hook.name == "post-merge" && hook.exists && !hook.isBdHook {
-				// Move to .post-merge-old
-				oldPath := hook.path + ".old"
-				if err := os.Rename(hook.path, oldPath); err != nil {
-					return fmt.Errorf("failed to move existing post-merge: %w", err)
-				}
-				existingPostMerge = oldPath
-				break
-			}
-		}
-
-		postMergeContent = `#!/bin/sh
-#
-# bd (beads) post-merge hook (chained)
-#
-# This hook chains bd functionality with your existing post-merge hook.
-
-# Run existing hook first
-if [ -x "` + existingPostMerge + `" ]; then
-    "` + existingPostMerge + `" "$@"
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -ne 0 ]; then
-        exit $EXIT_CODE
-    fi
-fi
-
-# Check if bd is available
-if ! command -v bd >/dev/null 2>&1; then
-    echo "Warning: bd command not found, skipping post-merge import" >&2
-    exit 0
-fi
-
-# Check if we're in a bd workspace
-if [ ! -d .beads ]; then
-    exit 0
-fi
-
-# Check if issues.jsonl exists and was updated
-if [ ! -f .beads/issues.jsonl ]; then
-    exit 0
-fi
-
-# Import the updated JSONL
-if ! bd import -i .beads/issues.jsonl >/dev/null 2>&1; then
-    echo "Warning: Failed to import bd changes after merge" >&2
-    echo "Run 'bd import -i .beads/issues.jsonl' manually to see the error" >&2
-fi
-
-exit 0
-`
-	} else {
-		postMergeContent = `#!/bin/sh
-#
-# bd (beads) post-merge hook
-#
-# This hook imports updated issues from .beads/issues.jsonl after a
-# git pull or merge, ensuring the database stays in sync with git.
-
-# Check if bd is available
-if ! command -v bd >/dev/null 2>&1; then
-    echo "Warning: bd command not found, skipping post-merge import" >&2
-    exit 0
-fi
-
-# Check if we're in a bd workspace
-if [ ! -d .beads ]; then
-    # Not a bd workspace, nothing to do
-    exit 0
-fi
-
-# Check if issues.jsonl exists and was updated
-if [ ! -f .beads/issues.jsonl ]; then
-    exit 0
-fi
-
-# Import the updated JSONL
-# The auto-import feature should handle this, but we force it here
-# to ensure immediate sync after merge
-if ! bd import -i .beads/issues.jsonl >/dev/null 2>&1; then
-    echo "Warning: Failed to import bd changes after merge" >&2
-    echo "Run 'bd import -i .beads/issues.jsonl' manually to see the error" >&2
-    # Don't fail the merge, just warn
-fi
-
-exit 0
-`
-	}
-
-	// Write pre-commit hook (executable scripts need 0700)
-	// #nosec G306 - git hooks must be executable
-	if err := os.WriteFile(preCommitPath, []byte(preCommitContent), 0700); err != nil {
-		return fmt.Errorf("failed to write pre-commit hook: %w", err)
-	}
-
-	// Write post-merge hook (executable scripts need 0700)
-	// #nosec G306 - git hooks must be executable
-	if err := os.WriteFile(postMergePath, []byte(postMergeContent), 0700); err != nil {
-		return fmt.Errorf("failed to write post-merge hook: %w", err)
-	}
-
-	if chainHooks {
-		green := color.New(color.FgGreen).SprintFunc()
-		fmt.Printf("%s Chained bd hooks with existing hooks\n", green("✓"))
-	}
-
-	return nil
-}
-
-// mergeDriverInstalled checks if bd merge driver is configured correctly
-func mergeDriverInstalled() bool {
-	// Check git config for merge driver
-	cmd := exec.Command("git", "config", "merge.beads.driver")
-	output, err := cmd.Output()
-	if err != nil || len(output) == 0 {
-		return false
-	}
-
-	// Check if using old invalid placeholders (%L/%R from versions <0.24.0)
-	// Git only supports %O (base), %A (current), %B (other)
-	driverConfig := strings.TrimSpace(string(output))
-	if strings.Contains(driverConfig, "%L") || strings.Contains(driverConfig, "%R") {
-		// Stale config with invalid placeholders - needs repair
-		return false
-	}
-
-	// Check if .gitattributes has the merge driver configured
-	gitattributesPath := ".gitattributes"
-	content, err := os.ReadFile(gitattributesPath)
-	if err != nil {
-		return false
-	}
-
-	// Look for beads JSONL merge attribute (either canonical or legacy filename)
-	hasCanonical := strings.Contains(string(content), ".beads/issues.jsonl") &&
-		strings.Contains(string(content), "merge=beads")
-	hasLegacy := strings.Contains(string(content), ".beads/beads.jsonl") &&
-		strings.Contains(string(content), "merge=beads")
-	return hasCanonical || hasLegacy
-}
-
-// installMergeDriver configures git to use bd merge for JSONL files
-func installMergeDriver() error {
-	// Configure git merge driver
-	cmd := exec.Command("git", "config", "merge.beads.driver", "bd merge %A %O %A %B")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to configure git merge driver: %w\n%s", err, output)
-	}
-
-	cmd = exec.Command("git", "config", "merge.beads.name", "bd JSONL merge driver")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		// Non-fatal, the name is just descriptive
-		fmt.Fprintf(os.Stderr, "Warning: failed to set merge driver name: %v\n%s", err, output)
-	}
-
-	// Create or update .gitattributes
-	gitattributesPath := ".gitattributes"
-
-	// Read existing .gitattributes if it exists
-	var existingContent string
-	content, err := os.ReadFile(gitattributesPath)
-	if err == nil {
-		existingContent = string(content)
-	}
-
-	// Check if beads merge driver is already configured
-	// Check for either pattern (issues.jsonl is canonical, beads.jsonl is legacy)
-	hasBeadsMerge := (strings.Contains(existingContent, ".beads/issues.jsonl") ||
-		strings.Contains(existingContent, ".beads/beads.jsonl")) &&
-		strings.Contains(existingContent, "merge=beads")
-
-	if !hasBeadsMerge {
-		// Append beads merge driver configuration (issues.jsonl is canonical)
-		beadsMergeAttr := "\n# Use bd merge for beads JSONL files\n.beads/issues.jsonl merge=beads\n"
-
-		newContent := existingContent
-		if !strings.HasSuffix(newContent, "\n") && len(newContent) > 0 {
-			newContent += "\n"
-		}
-		newContent += beadsMergeAttr
-
-		// Write updated .gitattributes (0644 is standard for .gitattributes)
-		// #nosec G306 - .gitattributes needs to be readable
-		if err := os.WriteFile(gitattributesPath, []byte(newContent), 0644); err != nil {
-			return fmt.Errorf("failed to update .gitattributes: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // migrateOldDatabases detects and migrates old database files to beads.db
@@ -986,191 +597,6 @@ func migrateOldDatabases(targetPath string, quiet bool) error {
 	return nil
 }
 
-// createConfigYaml creates the config.yaml template in the specified directory
-func createConfigYaml(beadsDir string, noDbMode bool) error {
-	configYamlPath := filepath.Join(beadsDir, "config.yaml")
-
-	// Skip if already exists
-	if _, err := os.Stat(configYamlPath); err == nil {
-		return nil
-	}
-
-	noDbLine := "# no-db: false"
-	if noDbMode {
-		noDbLine = "no-db: true  # JSONL-only mode, no SQLite database"
-	}
-
-	configYamlTemplate := fmt.Sprintf(`# Beads Configuration File
-# This file configures default behavior for all bd commands in this repository
-# All settings can also be set via environment variables (BD_* prefix)
-# or overridden with command-line flags
-
-# Issue prefix for this repository (used by bd init)
-# If not set, bd init will auto-detect from directory name
-# Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
-# issue-prefix: ""
-
-# Use no-db mode: load from JSONL, no SQLite, write back after each command
-# When true, bd will use .beads/issues.jsonl as the source of truth
-# instead of SQLite database
-%s
-
-# Disable daemon for RPC communication (forces direct database access)
-# no-daemon: false
-
-# Disable auto-flush of database to JSONL after mutations
-# no-auto-flush: false
-
-# Disable auto-import from JSONL when it's newer than database
-# no-auto-import: false
-
-# Enable JSON output by default
-# json: false
-
-# Default actor for audit trails (overridden by BD_ACTOR or --actor)
-# actor: ""
-
-# Path to database (overridden by BEADS_DB or --db)
-# db: ""
-
-# Auto-start daemon if not running (can also use BEADS_AUTO_START_DAEMON)
-# auto-start-daemon: true
-
-# Debounce interval for auto-flush (can also use BEADS_FLUSH_DEBOUNCE)
-# flush-debounce: "5s"
-
-# Git branch for beads commits (bd sync will commit to this branch)
-# IMPORTANT: Set this for team projects so all clones use the same sync branch.
-# This setting persists across clones (unlike database config which is gitignored).
-# Can also use BEADS_SYNC_BRANCH env var for local override.
-# If not set, bd sync will require you to run 'bd config set sync.branch <branch>'.
-# sync-branch: "beads-sync"
-
-# Multi-repo configuration (experimental - bd-307)
-# Allows hydrating from multiple repositories and routing writes to the correct JSONL
-# repos:
-#   primary: "."  # Primary repo (where this database lives)
-#   additional:   # Additional repos to hydrate from (read-only)
-#     - ~/beads-planning  # Personal planning repo
-#     - ~/work-planning   # Work planning repo
-
-# Integration settings (access with 'bd config get/set')
-# These are stored in the database, not in this file:
-# - jira.url
-# - jira.project
-# - linear.url
-# - linear.api-key
-# - github.org
-# - github.repo
-`, noDbLine)
-
-	if err := os.WriteFile(configYamlPath, []byte(configYamlTemplate), 0600); err != nil {
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	return nil
-}
-
-// createReadme creates the README.md file in the .beads directory
-func createReadme(beadsDir string) error {
-	readmePath := filepath.Join(beadsDir, "README.md")
-
-	// Skip if already exists
-	if _, err := os.Stat(readmePath); err == nil {
-		return nil
-	}
-
-	readmeTemplate := `# Beads - AI-Native Issue Tracking
-
-Welcome to Beads! This repository uses **Beads** for issue tracking - a modern, AI-native tool designed to live directly in your codebase alongside your code.
-
-## What is Beads?
-
-Beads is issue tracking that lives in your repo, making it perfect for AI coding agents and developers who want their issues close to their code. No web UI required - everything works through the CLI and integrates seamlessly with git.
-
-**Learn more:** [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
-
-## Quick Start
-
-### Essential Commands
-
-` + "```bash" + `
-# Create new issues
-bd create "Add user authentication"
-
-# View all issues
-bd list
-
-# View issue details
-bd show <issue-id>
-
-# Update issue status
-bd update <issue-id> --status in_progress
-bd update <issue-id> --status done
-
-# Sync with git remote
-bd sync
-` + "```" + `
-
-### Working with Issues
-
-Issues in Beads are:
-- **Git-native**: Stored in ` + "`.beads/issues.jsonl`" + ` and synced like code
-- **AI-friendly**: CLI-first design works perfectly with AI coding agents
-- **Branch-aware**: Issues can follow your branch workflow
-- **Always in sync**: Auto-syncs with your commits
-
-## Why Beads?
-
-✨ **AI-Native Design**
-- Built specifically for AI-assisted development workflows
-- CLI-first interface works seamlessly with AI coding agents
-- No context switching to web UIs
-
-🚀 **Developer Focused**
-- Issues live in your repo, right next to your code
-- Works offline, syncs when you push
-- Fast, lightweight, and stays out of your way
-
-🔧 **Git Integration**
-- Automatic sync with git commits
-- Branch-aware issue tracking
-- Intelligent JSONL merge resolution
-
-## Get Started with Beads
-
-Try Beads in your own projects:
-
-` + "```bash" + `
-# Install Beads
-curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-
-# Initialize in your repo
-bd init
-
-# Create your first issue
-bd create "Try out Beads"
-` + "```" + `
-
-## Learn More
-
-- **Documentation**: [github.com/steveyegge/beads/docs](https://github.com/steveyegge/beads/tree/main/docs)
-- **Quick Start Guide**: Run ` + "`bd quickstart`" + `
-- **Examples**: [github.com/steveyegge/beads/examples](https://github.com/steveyegge/beads/tree/main/examples)
-
----
-
-*Beads: Issue tracking that moves at the speed of thought* ⚡
-`
-
-	// Write README.md (0644 is standard for markdown files)
-	// #nosec G306 - README needs to be readable
-	if err := os.WriteFile(readmePath, []byte(readmeTemplate), 0644); err != nil {
-		return fmt.Errorf("failed to write README.md: %w", err)
-	}
-
-	return nil
-}
 
 // readFirstIssueFromJSONL reads the first issue from a JSONL file
 func readFirstIssueFromJSONL(path string) (*types.Issue, error) {
@@ -1211,12 +637,9 @@ func readFirstIssueFromJSONL(path string) (*types.Issue, error) {
 
 // readFirstIssueFromGit reads the first issue from a git ref (bd-0is: supports sync-branch)
 func readFirstIssueFromGit(jsonlPath, gitRef string) (*types.Issue, error) {
-	// Get content from git (use ToSlash for Windows compatibility)
-	gitPath := filepath.ToSlash(jsonlPath)
-	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204
-	output, err := cmd.Output()
+	output, err := readFromGitRef(jsonlPath, gitRef)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from git: %w", err)
+		return nil, err
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(output))
@@ -1242,135 +665,6 @@ func readFirstIssueFromGit(jsonlPath, gitRef string) (*types.Issue, error) {
 	return nil, nil
 }
 
-// setupStealthMode configures global git settings for stealth operation
-func setupStealthMode(verbose bool) error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get user home directory: %w", err)
-	}
-
-	// Setup global gitignore
-	if err := setupGlobalGitIgnore(homeDir, verbose); err != nil {
-		return fmt.Errorf("failed to setup global gitignore: %w", err)
-	}
-
-	// Setup claude settings
-	if err := setupClaudeSettings(verbose); err != nil {
-		return fmt.Errorf("failed to setup claude settings: %w", err)
-	}
-
-	if verbose {
-		green := color.New(color.FgGreen).SprintFunc()
-		cyan := color.New(color.FgCyan).SprintFunc()
-		fmt.Printf("\n%s Stealth mode configured successfully!\n\n", green("✓"))
-		fmt.Printf("  Global gitignore: %s\n", cyan(".beads/ and .claude/settings.local.json ignored"))
-		fmt.Printf("  Claude settings: %s\n\n", cyan("configured with bd onboard instruction"))
-		fmt.Printf("Your beads setup is now %s - other repo collaborators won't see any beads-related files.\n\n", cyan("invisible"))
-	}
-
-	return nil
-}
-
-// setupGlobalGitIgnore configures global gitignore to ignore beads and claude files
-func setupGlobalGitIgnore(homeDir string, verbose bool) error {
-	// Check if user already has a global gitignore file configured
-	cmd := exec.Command("git", "config", "--global", "core.excludesfile")
-	output, err := cmd.Output()
-
-	var ignorePath string
-
-	if err == nil && len(output) > 0 {
-		// User has already configured a global gitignore file, use it
-		ignorePath = strings.TrimSpace(string(output))
-
-		// Expand tilde if present (git config may return ~/... which Go doesn't expand)
-		if strings.HasPrefix(ignorePath, "~/") {
-			ignorePath = filepath.Join(homeDir, ignorePath[2:])
-		} else if ignorePath == "~" {
-			ignorePath = homeDir
-		}
-
-		if verbose {
-			fmt.Printf("Using existing configured global gitignore file: %s\n", ignorePath)
-		}
-	} else {
-		// No global gitignore file configured, check if standard location exists
-		configDir := filepath.Join(homeDir, ".config", "git")
-		standardIgnorePath := filepath.Join(configDir, "ignore")
-
-		if _, err := os.Stat(standardIgnorePath); err == nil {
-			// Standard global gitignore file exists, use it
-			// No need to set git config - git automatically uses this standard location
-			ignorePath = standardIgnorePath
-			if verbose {
-				fmt.Printf("Using existing global gitignore file: %s\n", ignorePath)
-			}
-		} else {
-			// No global gitignore file exists, create one in standard location
-			// No need to set git config - git automatically uses this standard location
-			ignorePath = standardIgnorePath
-
-			// Ensure config directory exists
-			if err := os.MkdirAll(configDir, 0755); err != nil {
-				return fmt.Errorf("failed to create git config directory: %w", err)
-			}
-
-			if verbose {
-				fmt.Printf("Creating new global gitignore file: %s\n", ignorePath)
-			}
-		}
-	}
-
-	// Read existing ignore file if it exists
-	var existingContent string
-	// #nosec G304 - user config path
-	if content, err := os.ReadFile(ignorePath); err == nil {
-		existingContent = string(content)
-	}
-
-	// Check if beads patterns already exist
-	beadsPattern := "**/.beads/"
-	claudePattern := "**/.claude/settings.local.json"
-
-	hasBeads := strings.Contains(existingContent, beadsPattern)
-	hasClaude := strings.Contains(existingContent, claudePattern)
-
-	if hasBeads && hasClaude {
-		if verbose {
-			fmt.Printf("Global gitignore already configured for stealth mode\n")
-		}
-		return nil
-	}
-
-	// Append missing patterns
-	newContent := existingContent
-	if !strings.HasSuffix(newContent, "\n") && len(newContent) > 0 {
-		newContent += "\n"
-	}
-
-	if !hasBeads || !hasClaude {
-		newContent += "\n# Beads stealth mode configuration (added by bd init --stealth)\n"
-	}
-
-	if !hasBeads {
-		newContent += beadsPattern + "\n"
-	}
-	if !hasClaude {
-		newContent += claudePattern + "\n"
-	}
-
-	// Write the updated ignore file
-	// #nosec G306 - config file needs 0644
-	if err := os.WriteFile(ignorePath, []byte(newContent), 0644); err != nil {
-		return fmt.Errorf("failed to write global gitignore: %w", err)
-	}
-
-	if verbose {
-		fmt.Printf("Configured global gitignore for stealth mode\n")
-	}
-
-	return nil
-}
 
 // checkExistingBeadsData checks for existing database files
 // and returns an error if found (safety guard for bd-emg)
@@ -1378,13 +672,30 @@ func setupGlobalGitIgnore(homeDir string, verbose bool) error {
 // Note: This only blocks when a database already exists (workspace is initialized).
 // Fresh clones with JSONL but no database are allowed - init will create the database
 // and import from JSONL automatically (bd-4h9: fixes circular dependency with doctor --fix).
+//
+// For worktrees, checks the main repository root instead of current directory
+// since worktrees should share the database with the main repository.
 func checkExistingBeadsData(prefix string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil // Can't determine CWD, allow init to proceed
 	}
 
-	beadsDir := filepath.Join(cwd, ".beads")
+	// Determine where to check for .beads directory
+	// Guard with isGitRepo() check first - on Windows, git commands may hang
+	// when run outside a git repository (GH#727)
+	var beadsDir string
+	if isGitRepo() && git.IsWorktree() {
+		// For worktrees, .beads should be in the main repository root
+		mainRepoRoot, err := git.GetMainRepoRoot()
+		if err != nil {
+			return nil // Can't determine main repo root, allow init to proceed
+		}
+		beadsDir = filepath.Join(mainRepoRoot, ".beads")
+	} else {
+		// For regular repos (or non-git directories), check current directory
+		beadsDir = filepath.Join(cwd, ".beads")
+	}
 
 	// Check if .beads directory exists
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
@@ -1394,9 +705,6 @@ func checkExistingBeadsData(prefix string) error {
 	// Check for existing database file
 	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 	if _, err := os.Stat(dbPath); err == nil {
-		yellow := color.New(color.FgYellow).SprintFunc()
-		cyan := color.New(color.FgCyan).SprintFunc()
-
 		return fmt.Errorf(`
 %s Found existing database: %s
 
@@ -1408,7 +716,7 @@ To use the existing database:
 To completely reinitialize (data loss warning):
   rm -rf .beads && bd init --prefix %s
 
-Aborting.`, yellow("⚠"), dbPath, cyan("bd list"), prefix)
+Aborting.`, ui.RenderWarn("⚠"), dbPath, ui.RenderAccent("bd list"), prefix)
 	}
 
 	// Fresh clones (JSONL exists but no database) are allowed - init will
@@ -1417,74 +725,4 @@ Aborting.`, yellow("⚠"), dbPath, cyan("bd list"), prefix)
 	// "bd doctor --fix" but doctor couldn't create a database (bd-4h9).
 
 	return nil // No database found, safe to init
-}
-
-
-
-// setupClaudeSettings creates or updates .claude/settings.local.json with onboard instruction
-func setupClaudeSettings(verbose bool) error {
-	claudeDir := ".claude"
-	settingsPath := filepath.Join(claudeDir, "settings.local.json")
-
-	// Create .claude directory if it doesn't exist
-	if err := os.MkdirAll(claudeDir, 0755); err != nil {
-		return fmt.Errorf("failed to create .claude directory: %w", err)
-	}
-
-	// Check if settings.local.json already exists
-	var existingSettings map[string]interface{}
-	// #nosec G304 - user config path
-	if content, err := os.ReadFile(settingsPath); err == nil {
-		if err := json.Unmarshal(content, &existingSettings); err != nil {
-			// Don't silently overwrite - the user has a file with invalid JSON
-			// that likely contains important settings they don't want to lose
-			return fmt.Errorf("existing %s contains invalid JSON: %w\nPlease fix the JSON syntax manually before running bd init", settingsPath, err)
-		}
-	} else if !os.IsNotExist(err) {
-		// File exists but couldn't be read (permissions issue, etc.)
-		return fmt.Errorf("failed to read existing %s: %w", settingsPath, err)
-	} else {
-		// File doesn't exist - create new empty settings
-		existingSettings = make(map[string]interface{})
-	}
-
-	// Add or update the prompt with onboard instruction
-	onboardPrompt := "Before starting any work, run 'bd onboard' to understand the current project state and available issues."
-
-	// Check if prompt already contains onboard instruction
-	if promptValue, exists := existingSettings["prompt"]; exists {
-		if promptStr, ok := promptValue.(string); ok {
-			if strings.Contains(promptStr, "bd onboard") {
-				if verbose {
-					fmt.Printf("Claude settings already configured with bd onboard instruction\n")
-				}
-				return nil
-			}
-			// Update existing prompt to include onboard instruction
-			existingSettings["prompt"] = promptStr + "\n\n" + onboardPrompt
-		} else {
-			// Existing prompt is not a string, replace it
-			existingSettings["prompt"] = onboardPrompt
-		}
-	} else {
-		// Add new prompt with onboard instruction
-		existingSettings["prompt"] = onboardPrompt
-	}
-
-	// Write updated settings
-	updatedContent, err := json.MarshalIndent(existingSettings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal settings JSON: %w", err)
-	}
-
-	// #nosec G306 - config file needs 0644
-	if err := os.WriteFile(settingsPath, updatedContent, 0644); err != nil {
-		return fmt.Errorf("failed to write claude settings: %w", err)
-	}
-
-	if verbose {
-		fmt.Printf("Configured Claude settings with bd onboard instruction\n")
-	}
-
-	return nil
 }

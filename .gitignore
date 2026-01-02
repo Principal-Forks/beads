@@ -111,3 +111,17 @@ beads-perf-*.prof
 bench-cpu-*.prof
 bd-profile-*.prof
 bd-trace-*.out
+# AI planning documents (ephemeral)
+history/
+
+# Orchestrator agent state
+state.json
+.beads/redirect
+
+# Claude Code runtime
+.runtime/
+
+# Augment AI configuration (user-specific)
+.augment/
+.agents/
+output

@@ -404,12 +404,18 @@ func TestCreateIssues(t *testing.T) {
 			checkFunc: func(t *testing.T, h *createIssuesTestHelper, issues []*types.Issue) {},
 		},
 		{
-			name: "closed_at invariant - closed status without closed_at",
+			name: "closed_at invariant - closed status without closed_at auto-sets it (GH#523)",
 			issues: []*types.Issue{
 				h.newIssue("", "Missing closed_at", types.StatusClosed, 1, types.TypeTask, nil),
 			},
-			wantErr: true,
-			checkFunc: func(t *testing.T, h *createIssuesTestHelper, issues []*types.Issue) {},
+			wantErr: false, // Defensive fix auto-sets closed_at instead of rejecting
+			checkFunc: func(t *testing.T, h *createIssuesTestHelper, issues []*types.Issue) {
+				h.assertCount(issues, 1)
+				h.assertEqual(types.StatusClosed, issues[0].Status, "status")
+				if issues[0].ClosedAt == nil {
+					t.Error("ClosedAt should be auto-set for closed issues (GH#523 defensive fix)")
+				}
+			},
 		},
 		{
 			name: "nil item in batch",
@@ -506,62 +512,8 @@ func TestCreateIssuesRollback(t *testing.T) {
 		}
 	})
 
-	t.Run("rollback on conflict with existing ID", func(t *testing.T) {
-		// Create an issue with explicit ID
-		existingIssue := &types.Issue{
-			ID:        "bd-existing",
-			Title:     "Existing issue",
-			Status:    types.StatusOpen,
-			Priority:  1,
-			IssueType: types.TypeTask,
-		}
-		err := store.CreateIssue(ctx, existingIssue, "test-user")
-		if err != nil {
-			t.Fatalf("failed to create existing issue: %v", err)
-		}
-
-		// Try to create batch with conflicting ID
-		issues := []*types.Issue{
-			{
-				Title:     "Should rollback",
-				Status:    types.StatusOpen,
-				Priority:  1,
-				IssueType: types.TypeTask,
-			},
-			{
-				ID:        "bd-existing",
-				Title:     "Conflict",
-				Status:    types.StatusOpen,
-				Priority:  1,
-				IssueType: types.TypeTask,
-			},
-		}
-
-		err = store.CreateIssues(ctx, issues, "test-user")
-		if err == nil {
-			t.Fatal("expected error for duplicate ID, got nil")
-		}
-
-		// Verify rollback - "Should rollback" issue should not exist
-		filter := types.IssueFilter{}
-		allIssues, err := store.SearchIssues(ctx, "", filter)
-		if err != nil {
-			t.Fatalf("failed to search issues: %v", err)
-		}
-
-		// Count should only include the pre-existing issues
-		foundRollback := false
-		for _, issue := range allIssues {
-			if issue.Title == "Should rollback" {
-				foundRollback = true
-				break
-			}
-		}
-
-		if foundRollback {
-			t.Error("expected rollback of all issues in batch, but 'Should rollback' was found")
-		}
-	})
+	// Note: "rollback on conflict with existing ID" test removed - CreateIssues
+	// uses INSERT OR IGNORE which silently skips duplicates (needed for JSONL import)
 }
 
 func TestUpdateIssue(t *testing.T) {
@@ -688,7 +640,7 @@ func TestCloseIssue(t *testing.T) {
 		t.Fatalf("CreateIssue failed: %v", err)
 	}
 
-	err = store.CloseIssue(ctx, issue.ID, "Done", "test-user")
+	err = store.CloseIssue(ctx, issue.ID, "Done", "test-user", "")
 	if err != nil {
 		t.Fatalf("CloseIssue failed: %v", err)
 	}
@@ -705,6 +657,10 @@ func TestCloseIssue(t *testing.T) {
 
 	if closed.ClosedAt == nil {
 		t.Error("ClosedAt should be set")
+	}
+
+	if closed.CloseReason != "Done" {
+		t.Errorf("CloseReason not set: got %q, want %q", closed.CloseReason, "Done")
 	}
 }
 
@@ -761,18 +717,21 @@ func TestClosedAtInvariant(t *testing.T) {
 		}
 
 		// Close the issue
-		err = store.CloseIssue(ctx, issue.ID, "Done", "test-user")
+		err = store.CloseIssue(ctx, issue.ID, "Done", "test-user", "")
 		if err != nil {
 			t.Fatalf("CloseIssue failed: %v", err)
 		}
 
-		// Verify it's closed with closed_at set
+		// Verify it's closed with closed_at and close_reason set
 		closed, err := store.GetIssue(ctx, issue.ID)
 		if err != nil {
 			t.Fatalf("GetIssue failed: %v", err)
 		}
 		if closed.ClosedAt == nil {
 			t.Fatal("ClosedAt should be set after closing")
+		}
+		if closed.CloseReason != "Done" {
+			t.Errorf("CloseReason should be 'Done', got %q", closed.CloseReason)
 		}
 
 		// Reopen the issue
@@ -784,7 +743,7 @@ func TestClosedAtInvariant(t *testing.T) {
 			t.Fatalf("UpdateIssue failed: %v", err)
 		}
 
-		// Verify closed_at was cleared
+		// Verify closed_at and close_reason were cleared
 		reopened, err := store.GetIssue(ctx, issue.ID)
 		if err != nil {
 			t.Fatalf("GetIssue failed: %v", err)
@@ -795,19 +754,25 @@ func TestClosedAtInvariant(t *testing.T) {
 		if reopened.ClosedAt != nil {
 			t.Error("ClosedAt should be cleared when reopening issue")
 		}
+		if reopened.CloseReason != "" {
+			t.Errorf("CloseReason should be cleared when reopening issue, got %q", reopened.CloseReason)
+		}
 	})
 
-	t.Run("CreateIssue rejects closed issue without closed_at", func(t *testing.T) {
+	t.Run("CreateIssue auto-sets closed_at for closed issue (GH#523)", func(t *testing.T) {
 		issue := &types.Issue{
 			Title:     "Test",
 			Status:    types.StatusClosed,
 			Priority:  2,
 			IssueType: types.TypeTask,
-			ClosedAt:  nil, // Invalid: closed without closed_at
+			ClosedAt:  nil, // Defensive fix should auto-set this
 		}
 		err := store.CreateIssue(ctx, issue, "test-user")
-		if err == nil {
-			t.Error("CreateIssue should reject closed issue without closed_at")
+		if err != nil {
+			t.Errorf("CreateIssue should auto-set closed_at (GH#523 defensive fix), got error: %v", err)
+		}
+		if issue.ClosedAt == nil {
+			t.Error("ClosedAt should be auto-set for closed issues (GH#523 defensive fix)")
 		}
 	})
 
@@ -847,7 +812,7 @@ func TestSearchIssues(t *testing.T) {
 		}
 		// Close the third issue
 		if issue.Title == "Another bug" {
-			err = store.CloseIssue(ctx, issue.ID, "Done", "test-user")
+			err = store.CloseIssue(ctx, issue.ID, "Done", "test-user", "")
 			if err != nil {
 				t.Fatalf("CloseIssue failed: %v", err)
 			}
@@ -1012,7 +977,7 @@ func TestGetStatistics(t *testing.T) {
 		}
 		// Close the one that should be closed
 		if issue.Title == "Closed task" {
-			err = store.CloseIssue(ctx, issue.ID, "Done", "test-user")
+			err = store.CloseIssue(ctx, issue.ID, "Done", "test-user", "")
 			if err != nil {
 				t.Fatalf("CloseIssue failed: %v", err)
 			}
@@ -1501,6 +1466,100 @@ func TestDeleteConfig(t *testing.T) {
 	}
 	if value != "" {
 		t.Errorf("Expected empty value after deletion, got: %s", value)
+	}
+}
+
+func TestConvoyReactiveCompletion(t *testing.T) {
+	store, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a convoy
+	convoy := &types.Issue{
+		Title:     "Test Convoy",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeConvoy,
+	}
+	err := store.CreateIssue(ctx, convoy, "test-user")
+	if err != nil {
+		t.Fatalf("CreateIssue convoy failed: %v", err)
+	}
+
+	// Create two issues to track
+	issue1 := &types.Issue{
+		Title:     "Tracked Issue 1",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	err = store.CreateIssue(ctx, issue1, "test-user")
+	if err != nil {
+		t.Fatalf("CreateIssue issue1 failed: %v", err)
+	}
+
+	issue2 := &types.Issue{
+		Title:     "Tracked Issue 2",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	err = store.CreateIssue(ctx, issue2, "test-user")
+	if err != nil {
+		t.Fatalf("CreateIssue issue2 failed: %v", err)
+	}
+
+	// Add tracking dependencies: convoy tracks issue1 and issue2
+	dep1 := &types.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: issue1.ID,
+		Type:        types.DepTracks,
+	}
+	err = store.AddDependency(ctx, dep1, "test-user")
+	if err != nil {
+		t.Fatalf("AddDependency for issue1 failed: %v", err)
+	}
+
+	dep2 := &types.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: issue2.ID,
+		Type:        types.DepTracks,
+	}
+	err = store.AddDependency(ctx, dep2, "test-user")
+	if err != nil {
+		t.Fatalf("AddDependency for issue2 failed: %v", err)
+	}
+
+	// Close first issue - convoy should still be open
+	err = store.CloseIssue(ctx, issue1.ID, "Done", "test-user", "")
+	if err != nil {
+		t.Fatalf("CloseIssue issue1 failed: %v", err)
+	}
+
+	convoyAfter1, err := store.GetIssue(ctx, convoy.ID)
+	if err != nil {
+		t.Fatalf("GetIssue convoy after issue1 closed failed: %v", err)
+	}
+	if convoyAfter1.Status == types.StatusClosed {
+		t.Error("Convoy should NOT be closed after only first tracked issue is closed")
+	}
+
+	// Close second issue - convoy should auto-close now
+	err = store.CloseIssue(ctx, issue2.ID, "Done", "test-user", "")
+	if err != nil {
+		t.Fatalf("CloseIssue issue2 failed: %v", err)
+	}
+
+	convoyAfter2, err := store.GetIssue(ctx, convoy.ID)
+	if err != nil {
+		t.Fatalf("GetIssue convoy after issue2 closed failed: %v", err)
+	}
+	if convoyAfter2.Status != types.StatusClosed {
+		t.Errorf("Convoy should be auto-closed when all tracked issues are closed, got status: %v", convoyAfter2.Status)
+	}
+	if convoyAfter2.CloseReason != "All tracked issues completed" {
+		t.Errorf("Convoy close reason should be 'All tracked issues completed', got: %q", convoyAfter2.CloseReason)
 	}
 }
 

@@ -2,6 +2,32 @@
 
 Complete installation guide for all platforms.
 
+## Components Overview
+
+Beads has several components - here's what they are and when you need them:
+
+| Component | What It Is | When You Need It |
+|-----------|------------|------------------|
+| **bd CLI** | Core command-line tool | Always - this is the foundation |
+| **Claude Code Plugin** | Slash commands + enhanced UX | Optional - if you want `/bd-ready`, `/bd-create` commands |
+| **MCP Server (beads-mcp)** | Model Context Protocol interface | Only for MCP-only environments (Claude Desktop, Amp) |
+
+**How they relate:**
+- The **bd CLI** is the core - install it first via Homebrew, npm, or script
+- The **Plugin** enhances Claude Code with slash commands but *requires* the CLI installed
+- The **MCP server** is an *alternative* to the CLI for environments without shell access
+
+**Typical setups:**
+
+| Environment | What to Install |
+|-------------|-----------------|
+| Claude Code, Cursor, Windsurf | bd CLI (+ optional Plugin for Claude Code) |
+| Claude Desktop (no shell) | MCP server only |
+| Terminal / scripts | bd CLI only |
+| CI/CD pipelines | bd CLI only |
+
+**Are they mutually exclusive?** No - you can have CLI + Plugin + MCP all installed. They don't conflict. But most users only need the CLI.
+
 ## Quick Install (Recommended)
 
 ### Homebrew (macOS/Linux)
@@ -28,6 +54,19 @@ The installer will:
 - Install via `go install` if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
+
+### Comparison of Installation Methods
+
+| Method | Best For | Updates | Prerequisites | Notes |
+|--------|----------|---------|---------------|-------|
+| **Homebrew** | macOS/Linux users | `brew upgrade bd` | Homebrew | Recommended. Handles everything automatically |
+| **npm** | JS/Node.js projects | `npm update -g @beads/bd` | Node.js | Convenient if npm is your ecosystem |
+| **Install script** | Quick setup, CI/CD | Re-run script | curl, bash | Good for automation and one-liners |
+| **go install** | Go developers | Re-run command | Go 1.24+ | Builds from source, always latest |
+| **From source** | Contributors, custom builds | `git pull && go build` | Go, git | Full control, can modify code |
+| **AUR (Arch)** | Arch Linux users | `yay -Syu` | yay/paru | Community-maintained |
+
+**TL;DR:** Use Homebrew if available. Use npm if you're in a Node.js environment. Use the script for quick one-off installs or CI.
 
 ## Platform-Specific Installation
 
@@ -133,21 +172,30 @@ brew install bd
 cd your-project
 bd init --quiet
 
-# 3. Install hooks for automatic context injection
-bd hooks install
+# 3. Setup editor integration (choose one)
+bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
+bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
+bd setup aider    # Aider - creates .aider.conf.yml
 ```
 
 **How it works:**
-- SessionStart hook runs `bd prime` automatically
-- `bd prime` injects ~1-2k tokens of workflow context
+- Editor hooks/rules inject `bd prime` automatically on session start
+- `bd prime` provides ~1-2k tokens of workflow context
 - You use `bd` CLI commands directly
-- Git hooks auto-sync the database
+- Git hooks (installed by `bd init`) auto-sync the database
 
 **Why this is recommended:**
 - **Context efficient** - ~1-2k tokens vs 10-50k for MCP tool schemas
 - **Lower latency** - Direct CLI calls, no MCP protocol overhead
 - **Universal** - Works with any editor that has shell access
 - **More sustainable** - Less compute per request
+
+**Verify installation:**
+```bash
+bd setup claude --check   # Check Claude Code integration
+bd setup cursor --check   # Check Cursor integration
+bd setup aider --check    # Check Aider integration
+```
 
 ### Claude Code Plugin (Optional)
 
@@ -210,7 +258,7 @@ Add to your MCP settings:
 - ❌ Higher context overhead (MCP schemas add 10-50k tokens)
 - ❌ Additional latency from MCP protocol
 
-See [integrations/beads-mcp/README.md](integrations/beads-mcp/README.md) for detailed MCP server documentation.
+See [integrations/beads-mcp/README.md](../integrations/beads-mcp/README.md) for detailed MCP server documentation.
 
 ## Verifying Installation
 
@@ -286,9 +334,9 @@ See the "Claude Code Plugin" section above for alternative installation methods 
 After installation:
 
 1. **Initialize a project**: `cd your-project && bd init`
-2. **Configure your agent**: Add bd instructions to `AGENTS.md` (see [README.md](README.md#quick-start))
-3. **Learn the basics**: Run `bd quickstart` for an interactive tutorial
-4. **Explore examples**: Check out the [examples/](examples/) directory
+2. **Configure your agent**: Add bd instructions to `AGENTS.md` (see [README.md](../README.md#quick-start))
+3. **Learn the basics**: See [QUICKSTART.md](QUICKSTART.md) for a tutorial
+4. **Explore examples**: Check out the [examples/](../examples/) directory
 
 ## Updating bd
 

@@ -11,8 +11,6 @@ import (
 
 // DatabaseConfig auto-detects and fixes metadata.json database/JSONL config mismatches.
 // This fixes the issue where metadata.json gets recreated with wrong JSONL filename.
-//
-// bd-afd: bd doctor --fix should auto-fix metadata.json jsonl_export mismatch
 func DatabaseConfig(path string) error {
 	if err := validateBeadsWorkspace(path); err != nil {
 		return err
@@ -31,6 +29,13 @@ func DatabaseConfig(path string) error {
 	}
 
 	fixed := false
+
+	// Never treat system JSONL files as a JSONL export configuration.
+	if isSystemJSONLFilename(cfg.JSONLExport) {
+		fmt.Printf("  Updating jsonl_export: %s → issues.jsonl\n", cfg.JSONLExport)
+		cfg.JSONLExport = "issues.jsonl"
+		fixed = true
+	}
 
 	// Check if configured JSONL exists
 	if cfg.JSONLExport != "" {
@@ -74,7 +79,6 @@ func DatabaseConfig(path string) error {
 
 // findActualJSONLFile scans .beads/ for the actual JSONL file in use.
 // Prefers issues.jsonl over beads.jsonl (canonical name), skips backups and merge artifacts.
-// bd-6xd: issues.jsonl is the canonical filename
 func findActualJSONLFile(beadsDir string) string {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
@@ -99,7 +103,15 @@ func findActualJSONLFile(beadsDir string) string {
 			strings.Contains(lowerName, ".orig") ||
 			strings.Contains(lowerName, ".bak") ||
 			strings.Contains(lowerName, "~") ||
-			strings.HasPrefix(lowerName, "backup_") {
+			strings.HasPrefix(lowerName, "backup_") ||
+			// System files are not JSONL exports.
+			name == "deletions.jsonl" ||
+			name == "interactions.jsonl" ||
+			name == "molecules.jsonl" ||
+			// Git merge conflict artifacts (e.g., issues.base.jsonl, issues.left.jsonl)
+			strings.Contains(lowerName, ".base.jsonl") ||
+			strings.Contains(lowerName, ".left.jsonl") ||
+			strings.Contains(lowerName, ".right.jsonl") {
 			continue
 		}
 
@@ -110,7 +122,7 @@ func findActualJSONLFile(beadsDir string) string {
 		return ""
 	}
 
-	// bd-6xd: Prefer issues.jsonl over beads.jsonl (canonical name)
+	// Prefer issues.jsonl over beads.jsonl (canonical name)
 	for _, name := range candidates {
 		if name == "issues.jsonl" {
 			return name
@@ -121,9 +133,17 @@ func findActualJSONLFile(beadsDir string) string {
 	return candidates[0]
 }
 
+func isSystemJSONLFilename(name string) bool {
+	switch name {
+	case "deletions.jsonl", "interactions.jsonl", "molecules.jsonl":
+		return true
+	default:
+		return false
+	}
+}
+
 // LegacyJSONLConfig migrates from legacy beads.jsonl to canonical issues.jsonl.
 // This renames the file, updates metadata.json, and updates .gitattributes if present.
-// bd-6xd: issues.jsonl is the canonical filename
 func LegacyJSONLConfig(path string) error {
 	if err := validateBeadsWorkspace(path); err != nil {
 		return err

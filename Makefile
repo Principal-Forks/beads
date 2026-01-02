@@ -8,12 +8,12 @@ all: build
 # Build the bd binary
 build:
 	@echo "Building bd..."
-	go build -o bd ./cmd/bd
+	go build -ldflags="-X main.Build=$$(git rev-parse --short HEAD)" -o bd ./cmd/bd
 
 # Run all tests (skips known broken tests listed in .test-skip)
 test:
 	@echo "Running tests..."
-	@./scripts/test.sh
+	@TEST_COVER=1 ./scripts/test.sh
 
 # Run performance benchmarks (10K and 20K issue databases with automatic CPU profiling)
 # Generates CPU profile: internal/storage/sqlite/bench-cpu-<timestamp>.prof
@@ -34,9 +34,11 @@ bench-quick:
 	go test -bench=. -benchtime=100ms -tags=bench -run=^$$ ./internal/storage/sqlite/ -timeout=15m
 
 # Install bd to GOPATH/bin
-install: build
+install:
 	@echo "Installing bd to $$(go env GOPATH)/bin..."
-	go install ./cmd/bd
+	@bash -c 'commit=$$(git rev-parse HEAD 2>/dev/null || echo ""); \
+		branch=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""); \
+		go install -ldflags="-X main.Commit=$$commit -X main.Branch=$$branch" ./cmd/bd'
 
 # Clean build artifacts and benchmark profiles
 clean:

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env sh
 # bd-hooks-version: 0.24.2
 #
 # bd (beads) pre-push hook
@@ -22,6 +22,12 @@
 # Check if we're in a bd workspace
 if [ ! -d .beads ]; then
     # Not a bd workspace, nothing to do
+    exit 0
+fi
+
+# Skip if bd sync is already in progress (GH#532: prevents circular error)
+# bd sync sets this env var when pushing from worktree
+if [ -n "$BD_SYNC_IN_PROGRESS" ]; then
     exit 0
 fi
 

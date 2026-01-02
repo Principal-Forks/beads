@@ -16,16 +16,11 @@ import (
 // localVersionFile is the gitignored file that stores the last bd version used locally.
 // This prevents the upgrade notification from firing repeatedly when git operations
 // reset the tracked metadata.json file.
-//
-// bd-tok: Fix upgrade notification persisting after git operations
 const localVersionFile = ".local_version"
 
 // trackBdVersion checks if bd version has changed since last run and updates the local version file.
 // This function is best-effort - failures are silent to avoid disrupting commands.
 // Sets global variables versionUpgradeDetected and previousVersion if upgrade detected.
-//
-// bd-loka: Built-in version tracking for upgrade awareness
-// bd-tok: Use gitignored .local_version file instead of metadata.json
 func trackBdVersion() {
 	// Find the beads directory
 	beadsDir := beads.FindBeadsDir()
@@ -61,7 +56,7 @@ func trackBdVersion() {
 		// No config file yet - create one
 		cfg = configfile.DefaultConfig()
 
-		// bd-afd: Auto-detect actual JSONL file instead of using hardcoded default
+		// Auto-detect actual JSONL file instead of using hardcoded default
 		// This prevents mismatches when metadata.json gets deleted (git clean, merge conflict, etc.)
 		if actualJSONL := findActualJSONLFile(beadsDir); actualJSONL != "" {
 			cfg.JSONLExport = actualJSONL
@@ -149,72 +144,12 @@ func maybeShowUpgradeNotification() {
 	fmt.Println("💡 Run 'bd upgrade review' to see what changed")
 	fmt.Println("💊 Run 'bd doctor' to verify upgrade completed cleanly")
 
-	// Check if BD_GUIDE.md exists and needs updating
-	checkAndSuggestBDGuideUpdate()
-
 	fmt.Println()
-}
-
-// checkAndSuggestBDGuideUpdate checks if .beads/BD_GUIDE.md exists and suggests regeneration if outdated.
-// bd-woro: Auto-update BD_GUIDE.md on version changes
-func checkAndSuggestBDGuideUpdate() {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return
-	}
-
-	guidePath := beadsDir + "/BD_GUIDE.md"
-
-	// Check if BD_GUIDE.md exists
-	if _, err := os.Stat(guidePath); os.IsNotExist(err) {
-		// File doesn't exist - no suggestion needed
-		return
-	}
-
-	// Read first few lines to check version stamp
-	// #nosec G304 - guidePath is constructed from beadsDir + constant string
-	content, err := os.ReadFile(guidePath)
-	if err != nil {
-		return // Silent failure
-	}
-
-	// Look for version in the first 200 bytes (should be in the header)
-	header := string(content)
-	if len(header) > 200 {
-		header = header[:200]
-	}
-
-	// Check if the file has the old version stamp
-	oldVersionStamp := fmt.Sprintf("bd v%s", previousVersion)
-	currentVersionStamp := fmt.Sprintf("bd v%s", Version)
-
-	if containsSubstring(header, oldVersionStamp) && !containsSubstring(header, currentVersionStamp) {
-		// BD_GUIDE.md is outdated
-		fmt.Printf("📄 BD_GUIDE.md is outdated (v%s → v%s)\n", previousVersion, Version)
-		fmt.Printf("💡 Run 'bd onboard --output .beads/BD_GUIDE.md' to regenerate\n")
-	}
-}
-
-// containsSubstring checks if haystack contains needle (case-sensitive)
-func containsSubstring(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && findSubstring(haystack, needle) >= 0
-}
-
-// findSubstring returns the index of needle in haystack, or -1 if not found
-func findSubstring(haystack, needle string) int {
-	for i := 0; i <= len(haystack)-len(needle); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return i
-		}
-	}
-	return -1
 }
 
 // findActualJSONLFile scans .beads/ for the actual JSONL file in use.
 // Prefers issues.jsonl over beads.jsonl (canonical name), skips backups and merge artifacts.
 // Returns empty string if no JSONL file is found.
-//
-// bd-6xd: Auto-detect JSONL file to prevent metadata.json mismatches
 func findActualJSONLFile(beadsDir string) string {
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
@@ -250,7 +185,7 @@ func findActualJSONLFile(beadsDir string) string {
 		return ""
 	}
 
-	// bd-6xd: Prefer issues.jsonl over beads.jsonl (canonical name)
+	// Prefer issues.jsonl over beads.jsonl (canonical name)
 	for _, name := range candidates {
 		if name == "issues.jsonl" {
 			return name
@@ -267,8 +202,6 @@ func findActualJSONLFile(beadsDir string) string {
 //
 // IMPORTANT: This must be called AFTER determining we're in direct mode (no daemon)
 // and BEFORE opening the database, to avoid: 1) conflicts with daemon, 2) opening DB twice.
-//
-// bd-jgxi: Auto-migrate database on CLI version bump
 func autoMigrateOnVersionBump(dbPath string) {
 	// Only migrate if version upgrade was detected
 	if !versionUpgradeDetected {

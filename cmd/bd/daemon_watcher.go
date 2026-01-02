@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/steveyegge/beads/internal/git"
 )
 
 // FileWatcher monitors JSONL and git ref changes using filesystem events or polling.
@@ -28,7 +29,12 @@ type FileWatcher struct {
 	lastHeadModTime time.Time
 	lastHeadExists bool
 	cancel         context.CancelFunc
-	wg             sync.WaitGroup // Track goroutines for graceful shutdown (bd-jo38)
+	wg             sync.WaitGroup // Track goroutines for graceful shutdown
+	// Log deduplication: track last log times to avoid duplicate messages
+	lastFileLogTime   time.Time
+	lastGitRefLogTime time.Time
+	logDedupeWindow   time.Duration
+	logMu             sync.Mutex
 }
 
 // NewFileWatcher creates a file watcher for the given JSONL path.
@@ -36,10 +42,11 @@ type FileWatcher struct {
 // Falls back to polling mode if fsnotify fails (controlled by BEADS_WATCHER_FALLBACK env var).
 func NewFileWatcher(jsonlPath string, onChanged func()) (*FileWatcher, error) {
 	fw := &FileWatcher{
-		jsonlPath:    jsonlPath,
-		parentDir:    filepath.Dir(jsonlPath),
-		debouncer:    NewDebouncer(500*time.Millisecond, onChanged),
-		pollInterval: 5 * time.Second,
+		jsonlPath:       jsonlPath,
+		parentDir:       filepath.Dir(jsonlPath),
+		debouncer:       NewDebouncer(500*time.Millisecond, onChanged),
+		pollInterval:    5 * time.Second,
+		logDedupeWindow: 500 * time.Millisecond, // Deduplicate logs within this window
 	}
 
 	// Get initial file state for polling fallback
@@ -53,10 +60,16 @@ func NewFileWatcher(jsonlPath string, onChanged func()) (*FileWatcher, error) {
 	fallbackEnv := os.Getenv("BEADS_WATCHER_FALLBACK")
 	fallbackDisabled := fallbackEnv == "false" || fallbackEnv == "0"
 
-	// Store git paths for filtering
-	gitDir := filepath.Join(fw.parentDir, "..", ".git")
-	fw.gitRefsPath = filepath.Join(gitDir, "refs", "heads")
-	fw.gitHeadPath = filepath.Join(gitDir, "HEAD")
+	// Store git paths for filtering using worktree-aware detection
+	gitDir, err := git.GetGitDir()
+	if err != nil {
+		// Not a git repo, skip git path setup
+		fw.gitRefsPath = ""
+		fw.gitHeadPath = ""
+	} else {
+		fw.gitRefsPath = filepath.Join(gitDir, "refs", "heads")
+		fw.gitHeadPath = filepath.Join(gitDir, "HEAD")
+	}
 
 	// Get initial git HEAD state for polling
 	if stat, err := os.Stat(fw.gitHeadPath); err == nil {
@@ -103,10 +116,38 @@ func NewFileWatcher(jsonlPath string, onChanged func()) (*FileWatcher, error) {
 	}
 
 	// Also watch .git/refs/heads and .git/HEAD for branch changes (best effort)
-	_ = watcher.Add(fw.gitRefsPath) // Ignore error - not all setups have this
-	_ = watcher.Add(fw.gitHeadPath)  // Ignore error - not all setups have this
+	if fw.gitRefsPath != "" {
+		_ = watcher.Add(fw.gitRefsPath) // Ignore error - not all setups have this
+	}
+	if fw.gitHeadPath != "" {
+		_ = watcher.Add(fw.gitHeadPath)  // Ignore error - not all setups have this
+	}
 
 	return fw, nil
+}
+
+// shouldLogFileChange returns true if enough time has passed since last file change log
+func (fw *FileWatcher) shouldLogFileChange() bool {
+	fw.logMu.Lock()
+	defer fw.logMu.Unlock()
+	now := time.Now()
+	if now.Sub(fw.lastFileLogTime) >= fw.logDedupeWindow {
+		fw.lastFileLogTime = now
+		return true
+	}
+	return false
+}
+
+// shouldLogGitRefChange returns true if enough time has passed since last git ref change log
+func (fw *FileWatcher) shouldLogGitRefChange() bool {
+	fw.logMu.Lock()
+	defer fw.logMu.Unlock()
+	now := time.Now()
+	if now.Sub(fw.lastGitRefLogTime) >= fw.logDedupeWindow {
+		fw.lastGitRefLogTime = now
+		return true
+	}
+	return false
 }
 
 // Start begins monitoring filesystem events or polling.
@@ -145,7 +186,9 @@ func (fw *FileWatcher) Start(ctx context.Context, log daemonLogger) {
 
 				// Handle JSONL write/chmod events
 				if event.Name == fw.jsonlPath && event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Chmod) != 0 {
-					log.log("File change detected: %s (op: %v)", event.Name, event.Op)
+					if fw.shouldLogFileChange() {
+						log.log("File change detected: %s", event.Name)
+					}
 					fw.debouncer.Trigger()
 					continue
 				}
@@ -168,7 +211,9 @@ func (fw *FileWatcher) Start(ctx context.Context, log daemonLogger) {
 
 				// Handle git ref changes (only events under gitRefsPath)
 				if event.Op&fsnotify.Write != 0 && strings.HasPrefix(event.Name, fw.gitRefsPath) {
-					log.log("Git ref change detected: %s", event.Name)
+					if fw.shouldLogGitRefChange() {
+						log.log("Git ref change detected: %s", event.Name)
+					}
 					fw.debouncer.Trigger()
 					continue
 				}
@@ -258,31 +303,33 @@ func (fw *FileWatcher) startPolling(ctx context.Context, log daemonLogger) {
 					}
 				}
 
-				// Check .git/HEAD for branch changes
-				headStat, err := os.Stat(fw.gitHeadPath)
-				if err != nil {
-					if os.IsNotExist(err) {
-						if fw.lastHeadExists {
-							fw.lastHeadExists = false
-							fw.lastHeadModTime = time.Time{}
-							log.log("Git HEAD missing (polling): %s", fw.gitHeadPath)
+				// Check .git/HEAD for branch changes (only if git paths are available)
+				if fw.gitHeadPath != "" {
+					headStat, err := os.Stat(fw.gitHeadPath)
+					if err != nil {
+						if os.IsNotExist(err) {
+							if fw.lastHeadExists {
+								fw.lastHeadExists = false
+								fw.lastHeadModTime = time.Time{}
+								log.log("Git HEAD missing (polling): %s", fw.gitHeadPath)
+								changed = true
+							}
+						}
+						// Ignore other errors for HEAD - it's optional
+					} else {
+						// HEAD exists
+						if !fw.lastHeadExists {
+							// HEAD appeared
+							fw.lastHeadExists = true
+							fw.lastHeadModTime = headStat.ModTime()
+							log.log("Git HEAD appeared (polling): %s", fw.gitHeadPath)
+							changed = true
+						} else if !headStat.ModTime().Equal(fw.lastHeadModTime) {
+							// HEAD changed (branch switch)
+							fw.lastHeadModTime = headStat.ModTime()
+							log.log("Git HEAD change detected (polling): %s", fw.gitHeadPath)
 							changed = true
 						}
-					}
-					// Ignore other errors for HEAD - it's optional
-				} else {
-					// HEAD exists
-					if !fw.lastHeadExists {
-						// HEAD appeared
-						fw.lastHeadExists = true
-						fw.lastHeadModTime = headStat.ModTime()
-						log.log("Git HEAD appeared (polling): %s", fw.gitHeadPath)
-						changed = true
-					} else if !headStat.ModTime().Equal(fw.lastHeadModTime) {
-						// HEAD changed (branch switch)
-						fw.lastHeadModTime = headStat.ModTime()
-						log.log("Git HEAD change detected (polling): %s", fw.gitHeadPath)
-						changed = true
 					}
 				}
 
@@ -303,7 +350,7 @@ func (fw *FileWatcher) Close() error {
 	if fw.cancel != nil {
 		fw.cancel()
 	}
-	// Wait for goroutines to finish before cleanup (bd-jo38)
+	// Wait for goroutines to finish before cleanup
 	fw.wg.Wait()
 	fw.debouncer.Cancel()
 	if fw.watcher != nil {

@@ -212,9 +212,9 @@ func TestAddCommentMarksDirty(t *testing.T) {
 	}
 
 	// Clear dirty issues
-	err = store.ClearDirtyIssues(ctx)
+	err = store.ClearDirtyIssuesByID(ctx, []string{issue.ID})
 	if err != nil {
-		t.Fatalf("ClearDirtyIssues failed: %v", err)
+		t.Fatalf("ClearDirtyIssuesByID failed: %v", err)
 	}
 
 	// Add comment - should mark issue dirty
@@ -311,7 +311,7 @@ func TestEventTypesInHistory(t *testing.T) {
 		t.Fatalf("AddLabel failed: %v", err)
 	}
 
-	err = store.CloseIssue(ctx, issue.ID, "Done", "test-user")
+	err = store.CloseIssue(ctx, issue.ID, "Done", "test-user", "")
 	if err != nil {
 		t.Fatalf("CloseIssue failed: %v", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -10,21 +11,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/deletions"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // isJSONLNewer checks if JSONL file is newer than database file.
 // Returns true if JSONL is newer AND has different content, false otherwise.
-// This prevents false positives from daemon auto-export timestamp skew (bd-lm2q).
+// This prevents false positives from daemon auto-export timestamp skew.
 //
 // NOTE: This uses computeDBHash which is more expensive than hasJSONLChanged.
 // For daemon auto-import, prefer hasJSONLChanged() which uses metadata-based
-// content tracking and is safe against git operations (bd-khnb).
+// content tracking and is safe against git operations.
 func isJSONLNewer(jsonlPath string) bool {
 	return isJSONLNewerWithStore(jsonlPath, nil)
 }
@@ -97,16 +97,16 @@ func computeJSONLHash(jsonlPath string) (string, error) {
 // unchanged) while still catching git operations that restore old content with new mtimes.
 //
 // In multi-repo mode, keySuffix should be the stable repo identifier (e.g., ".", "../frontend").
-// The keySuffix must not contain the ':' separator character (bd-ar2.12).
+// The keySuffix must not contain the ':' separator character.
 func hasJSONLChanged(ctx context.Context, store storage.Storage, jsonlPath string, keySuffix string) bool {
-	// Validate keySuffix doesn't contain the separator character (bd-ar2.12)
+	// Validate keySuffix doesn't contain the separator character
 	if keySuffix != "" && strings.Contains(keySuffix, ":") {
 		// Invalid keySuffix - treat as changed to trigger proper error handling
 		return true
 	}
 
-	// Build metadata keys with optional suffix for per-repo tracking (bd-ar2.10, bd-ar2.11)
-	// Renamed from last_import_hash to jsonl_content_hash (bd-39o) - more accurate name
+	// Build metadata keys with optional suffix for per-repo tracking
+	// Renamed from last_import_hash to jsonl_content_hash - more accurate name
 	// since this hash is updated on both import AND export
 	hashKey := "jsonl_content_hash"
 	oldHashKey := "last_import_hash" // Migration: check old key if new key missing
@@ -115,7 +115,7 @@ func hasJSONLChanged(ctx context.Context, store storage.Storage, jsonlPath strin
 		oldHashKey += ":" + keySuffix
 	}
 
-	// Always compute content hash (bd-v0y fix)
+	// Always compute content hash
 	// Previous mtime-based fast-path was unsafe: git operations (pull, checkout, rebase)
 	// can change file content without updating mtime, causing false negatives.
 	// Hash computation is fast enough for sync operations (~10-50ms even for large DBs).
@@ -128,7 +128,7 @@ func hasJSONLChanged(ctx context.Context, store storage.Storage, jsonlPath strin
 	// Get content hash from metadata (try new key first, fall back to old for migration)
 	lastHash, err := store.GetMetadata(ctx, hashKey)
 	if err != nil || lastHash == "" {
-		// Try old key for migration (bd-39o)
+		// Try old key for migration
 		lastHash, err = store.GetMetadata(ctx, oldHashKey)
 		if err != nil || lastHash == "" {
 			// No previous hash - this is the first run or metadata is missing
@@ -145,8 +145,8 @@ func hasJSONLChanged(ctx context.Context, store storage.Storage, jsonlPath strin
 // Returns error if critical issues found that would cause data loss.
 func validatePreExport(ctx context.Context, store storage.Storage, jsonlPath string) error {
 	// Check if JSONL content has changed since last import - if so, must import first
-	// Uses content-based detection (bd-xwo fix) instead of mtime-based to avoid false positives from git operations
-	// Use getRepoKeyForPath to get stable repo identifier for multi-repo support (bd-ar2.10, bd-ar2.11)
+	// Uses content-based detection instead of mtime-based to avoid false positives from git operations
+	// Use getRepoKeyForPath to get stable repo identifier for multi-repo support
 	repoKey := getRepoKeyForPath(jsonlPath)
 	if hasJSONLChanged(ctx, store, jsonlPath, repoKey) {
 		return fmt.Errorf("refusing to export: JSONL content has changed since last import (import first to avoid data loss)")
@@ -180,7 +180,7 @@ func validatePreExport(ctx context.Context, store storage.Storage, jsonlPath str
 		return fmt.Errorf("refusing to export empty DB over %d issues in JSONL (would cause data loss)", jsonlCount)
 	}
 
-	// Note: The main bd-53c protection is the reverse ZFC check in sync.go
+	// Note: The main protection is the reverse ZFC check in sync.go
 	// which runs BEFORE this validation. Here we only block empty DB.
 	// This allows legitimate deletions while sync.go catches stale DBs.
 
@@ -298,74 +298,41 @@ func checkOrphanedDeps(ctx context.Context, store storage.Storage) ([]string, er
 
 // validatePostImport checks that import didn't cause data loss.
 // Returns error if issue count decreased unexpectedly (data loss) or nil if OK.
-// A decrease is legitimate if it matches deletions recorded in deletions.jsonl.
 //
 // Parameters:
 //   - before: issue count in DB before import
 //   - after: issue count in DB after import
-//   - jsonlPath: path to issues.jsonl (used to locate deletions.jsonl)
-func validatePostImport(before, after int, jsonlPath string) error {
-	return validatePostImportWithExpectedDeletions(before, after, 0, jsonlPath)
+//   - jsonlPath: path to issues.jsonl (unused, kept for API compatibility)
+func validatePostImport(before, after int, _ string) error {
+	return validatePostImportWithExpectedDeletions(before, after, 0, "")
 }
 
 // validatePostImportWithExpectedDeletions checks that import didn't cause data loss,
-// accounting for expected deletions that were already sanitized from the JSONL.
+// accounting for expected deletions (e.g., tombstones).
 // Returns error if issue count decreased unexpectedly (data loss) or nil if OK.
 //
 // Parameters:
 //   - before: issue count in DB before import
 //   - after: issue count in DB after import
-//   - expectedDeletions: number of issues known to have been deleted (from sanitize step)
-//   - jsonlPath: path to issues.jsonl (used to locate deletions.jsonl)
-func validatePostImportWithExpectedDeletions(before, after, expectedDeletions int, jsonlPath string) error {
+//   - expectedDeletions: number of issues known to have been deleted
+//   - jsonlPath: unused, kept for API compatibility
+func validatePostImportWithExpectedDeletions(before, after, expectedDeletions int, _ string) error {
 	if after < before {
-		// Count decrease - check if this matches legitimate deletions
 		decrease := before - after
 
-		// First, account for expected deletions from the sanitize step (bd-tt0 fix)
-		// These were already removed from JSONL and will be purged from DB by import
+		// Account for expected deletions (tombstones converted to actual deletions)
 		if expectedDeletions > 0 && decrease <= expectedDeletions {
-			// Decrease is fully accounted for by expected deletions
-			fmt.Fprintf(os.Stderr, "Import complete: %d → %d issues (-%d, expected from sanitize)\n",
+			fmt.Fprintf(os.Stderr, "Import complete: %d → %d issues (-%d, expected deletions)\n",
 				before, after, decrease)
 			return nil
 		}
 
-		// If decrease exceeds expected deletions, check deletions manifest for additional legitimacy
-		unexplainedDecrease := decrease - expectedDeletions
-
-		// Load deletions manifest to check for legitimate deletions
-		beadsDir := filepath.Dir(jsonlPath)
-		deletionsPath := deletions.DefaultPath(beadsDir)
-		loadResult, err := deletions.LoadDeletions(deletionsPath)
-		if err != nil {
-			// If we can't load deletions, assume the worst
-			return fmt.Errorf("import reduced issue count: %d → %d (data loss detected! failed to verify deletions: %v)", before, after, err)
-		}
-
-		// If there are deletions recorded, the decrease is likely legitimate
-		// We can't perfectly match because we don't know exactly which issues
-		// were deleted in this sync cycle vs previously. But if there are ANY
-		// deletions recorded and the decrease is reasonable, allow it.
-		numDeletions := len(loadResult.Records)
-		if numDeletions > 0 && unexplainedDecrease <= numDeletions {
-			// Legitimate deletion - decrease is accounted for by deletions manifest
-			if expectedDeletions > 0 {
-				fmt.Fprintf(os.Stderr, "Import complete: %d → %d issues (-%d, %d from sanitize + %d from deletions manifest)\n",
-					before, after, decrease, expectedDeletions, unexplainedDecrease)
-			} else {
-				fmt.Fprintf(os.Stderr, "Import complete: %d → %d issues (-%d, accounted for by %d deletion(s))\n",
-					before, after, decrease, numDeletions)
-			}
-			return nil
-		}
-
-		// Decrease exceeds recorded deletions - potential data loss
-		if numDeletions > 0 || expectedDeletions > 0 {
-			return fmt.Errorf("import reduced issue count: %d → %d (-%d exceeds %d expected + %d recorded deletion(s) - potential data loss!)",
-				before, after, decrease, expectedDeletions, numDeletions)
-		}
-		return fmt.Errorf("import reduced issue count: %d → %d (data loss detected! no deletions recorded)", before, after)
+		// Unexpected decrease - warn but don't fail
+		// With tombstones as the deletion mechanism, decreases are unusual
+		// but can happen during cleanup or migration
+		fmt.Fprintf(os.Stderr, "Warning: import reduced issue count: %d → %d (-%d)\n",
+			before, after, decrease)
+		return nil
 	}
 	if after == before {
 		fmt.Fprintf(os.Stderr, "Import complete: no changes\n")
@@ -401,7 +368,8 @@ func countDBIssuesFast(ctx context.Context, store storage.Storage) (int, error) 
 	}
 
 	// Fallback: load all issues and count them (slow but always works)
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	// Include tombstones to match JSONL count which includes tombstones
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{IncludeTombstones: true})
 	if err != nil {
 		return 0, fmt.Errorf("failed to count database issues: %w", err)
 	}
@@ -464,8 +432,8 @@ func computeDBHash(ctx context.Context, store storage.Storage) (string, error) {
 	}
 
 	// Sort by ID for consistent hash
-	sort.Slice(issues, func(i, j int) bool {
-		return issues[i].ID < issues[j].ID
+	slices.SortFunc(issues, func(a, b *types.Issue) int {
+		return cmp.Compare(a.ID, b.ID)
 	})
 
 	// Populate dependencies

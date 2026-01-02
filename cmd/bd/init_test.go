@@ -27,7 +27,7 @@ func TestInitCommand(t *testing.T) {
 			name:           "init with custom prefix",
 			prefix:         "myproject",
 			quiet:          false,
-			wantOutputText: "myproject-1, myproject-2",
+			wantOutputText: "myproject-<hash>",
 		},
 		{
 			name:         "init with quiet flag",
@@ -39,7 +39,7 @@ func TestInitCommand(t *testing.T) {
 			name:           "init with prefix ending in hyphen",
 			prefix:         "test-",
 			quiet:          false,
-			wantOutputText: "test-1, test-2",
+			wantOutputText: "test-<hash>",
 		},
 	}
 
@@ -129,7 +129,7 @@ func TestInitCommand(t *testing.T) {
 					"beads.base.jsonl",
 					"beads.left.jsonl",
 					"beads.right.jsonl",
-					"!issues.jsonl",
+					"Do NOT add negation patterns", // Comment explaining fork protection
 				}
 				for _, pattern := range expectedPatterns {
 					if !strings.Contains(gitignoreStr, pattern) {
@@ -183,6 +183,96 @@ func TestInitCommand(t *testing.T) {
 
 // Note: Error case testing is omitted because the init command calls os.Exit()
 // on errors, which makes it difficult to test in a unit test context.
+// GH#807: Rejection of main/master as sync branch is tested at unit level in
+// internal/syncbranch/syncbranch_test.go (TestValidateSyncBranchName, TestSet).
+
+// TestInitWithSyncBranch verifies that --branch flag correctly sets sync.branch
+// GH#807: Also verifies that valid sync branches work (rejection is tested at unit level)
+func TestInitWithSyncBranch(t *testing.T) {
+	// Reset global state
+	origDBPath := dbPath
+	defer func() { dbPath = origDBPath }()
+	dbPath = ""
+
+	// Reset Cobra flags
+	initCmd.Flags().Set("branch", "")
+
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	// Initialize git repo first (needed for sync branch to make sense)
+	if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=dev"); err != nil {
+		t.Fatalf("Failed to init git: %v", err)
+	}
+
+	// Run bd init with --branch flag
+	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--branch", "beads-sync", "--quiet"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("Init with --branch failed: %v", err)
+	}
+
+	// Verify database was created
+	dbFilePath := filepath.Join(tmpDir, ".beads", "beads.db")
+	store, err := openExistingTestDB(t, dbFilePath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	// Verify sync.branch was set correctly
+	ctx := context.Background()
+	syncBranch, err := store.GetConfig(ctx, "sync.branch")
+	if err != nil {
+		t.Fatalf("Failed to get sync.branch from database: %v", err)
+	}
+	if syncBranch != "beads-sync" {
+		t.Errorf("Expected sync.branch 'beads-sync', got %q", syncBranch)
+	}
+}
+
+// TestInitWithoutBranchFlag verifies that sync.branch is NOT auto-set when --branch is omitted
+// GH#807: This was the root cause - init was auto-detecting current branch (e.g., main)
+func TestInitWithoutBranchFlag(t *testing.T) {
+	// Reset global state
+	origDBPath := dbPath
+	defer func() { dbPath = origDBPath }()
+	dbPath = ""
+
+	// Reset Cobra flags
+	initCmd.Flags().Set("branch", "")
+
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	// Initialize git repo on 'main' branch
+	if err := runCommandInDir(tmpDir, "git", "init", "--initial-branch=main"); err != nil {
+		t.Fatalf("Failed to init git: %v", err)
+	}
+
+	// Run bd init WITHOUT --branch flag
+	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Verify database was created
+	dbFilePath := filepath.Join(tmpDir, ".beads", "beads.db")
+	store, err := openExistingTestDB(t, dbFilePath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	// Verify sync.branch was NOT set (empty = use current branch directly)
+	ctx := context.Background()
+	syncBranch, err := store.GetConfig(ctx, "sync.branch")
+	if err != nil {
+		t.Fatalf("Failed to get sync.branch from database: %v", err)
+	}
+	if syncBranch != "" {
+		t.Errorf("Expected sync.branch to be empty (not auto-detected), got %q", syncBranch)
+	}
+}
 
 func TestInitAlreadyInitialized(t *testing.T) {
 	// Reset global state
@@ -1046,4 +1136,93 @@ func TestSetupClaudeSettings_NoExistingFile(t *testing.T) {
 	if !strings.Contains(string(content), "bd onboard") {
 		t.Error("File should contain bd onboard prompt")
 	}
+}
+
+// TestSetupGlobalGitIgnore_ReadOnly verifies graceful handling when the
+// gitignore file cannot be written (prints manual instructions instead of failing).
+func TestSetupGlobalGitIgnore_ReadOnly(t *testing.T) {
+	t.Run("read-only file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configDir := filepath.Join(tmpDir, ".config", "git")
+		if err := os.MkdirAll(configDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		ignorePath := filepath.Join(configDir, "ignore")
+		if err := os.WriteFile(ignorePath, []byte("# existing\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ignorePath, 0444); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(ignorePath, 0644)
+
+		output := captureStdout(t, func() error {
+			return setupGlobalGitIgnore(tmpDir, "/test/project", false)
+		})
+
+		if !strings.Contains(output, "Unable to write") {
+			t.Error("expected instructions for manual addition")
+		}
+		if !strings.Contains(output, "/test/project/.beads/") {
+			t.Error("expected .beads pattern in output")
+		}
+	})
+
+	t.Run("symlink to read-only file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Target file in a separate location
+		targetDir := filepath.Join(tmpDir, "target")
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		targetFile := filepath.Join(targetDir, "ignore")
+		if err := os.WriteFile(targetFile, []byte("# existing\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(targetFile, 0444); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(targetFile, 0644)
+
+		// Symlink from expected location
+		configDir := filepath.Join(tmpDir, ".config", "git")
+		if err := os.MkdirAll(configDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(targetFile, filepath.Join(configDir, "ignore")); err != nil {
+			t.Fatal(err)
+		}
+
+		output := captureStdout(t, func() error {
+			return setupGlobalGitIgnore(tmpDir, "/test/project", false)
+		})
+
+		if !strings.Contains(output, "Unable to write") {
+			t.Error("expected instructions for manual addition")
+		}
+		if !strings.Contains(output, "/test/project/.beads/") {
+			t.Error("expected .beads pattern in output")
+		}
+	})
+}
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := fn()
+
+	w.Close()
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	os.Stdout = oldStdout
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	return buf.String()
 }

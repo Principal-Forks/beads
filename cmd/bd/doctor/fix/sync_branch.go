@@ -32,8 +32,7 @@ func SyncBranchConfig(path string) error {
 	}
 
 	// Set sync.branch using bd config set
-	// #nosec G204 - bdBinary is controlled by getBdBinary() which returns os.Executable()
-	setCmd := exec.Command(bdBinary, "config", "set", "sync.branch", currentBranch)
+	setCmd := newBdCmd(bdBinary, "config", "set", "sync.branch", currentBranch)
 	setCmd.Dir = path
 	if output, err := setCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to set sync.branch: %w\nOutput: %s", err, string(output))
@@ -47,8 +46,6 @@ func SyncBranchConfig(path string) error {
 // This handles two cases:
 // 1. Local sync branch diverged from remote (after force-push)
 // 2. Sync branch far behind main on source files
-//
-// bd-6rf: Detect and fix stale beads-sync branch
 func SyncBranchHealth(path, syncBranch string) error {
 	if err := validateBeadsWorkspace(path); err != nil {
 		return err

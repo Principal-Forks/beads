@@ -2,6 +2,9 @@ package rpc
 
 import (
 	"encoding/json"
+	"time"
+
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // Operation constants for all bd commands
@@ -17,6 +20,7 @@ const (
 	OpCount           = "count"
 	OpShow            = "show"
 	OpReady           = "ready"
+	OpBlocked         = "blocked"
 	OpStale           = "stale"
 	OpStats           = "stats"
 	OpDepAdd          = "dep_add"
@@ -34,8 +38,20 @@ const (
 	OpExport          = "export"
 	OpImport          = "import"
 	OpEpicStatus      = "epic_status"
-	OpGetMutations    = "get_mutations"
-	OpShutdown        = "shutdown"
+	OpGetMutations        = "get_mutations"
+	OpGetMoleculeProgress = "get_molecule_progress"
+	OpShutdown            = "shutdown"
+	OpDelete              = "delete"
+	OpGetWorkerStatus     = "get_worker_status"
+	OpGetConfig           = "get_config"
+	OpMolStale            = "mol_stale"
+
+	// Gate operations
+	OpGateCreate = "gate_create"
+	OpGateList   = "gate_list"
+	OpGateShow   = "gate_show"
+	OpGateClose  = "gate_close"
+	OpGateWait   = "gate_wait"
 )
 
 // Request represents an RPC request from client to daemon
@@ -66,11 +82,35 @@ type CreateArgs struct {
 	Priority           int      `json:"priority"`
 	Design             string   `json:"design,omitempty"`
 	AcceptanceCriteria string   `json:"acceptance_criteria,omitempty"`
+	Notes              string   `json:"notes,omitempty"`
 	Assignee           string   `json:"assignee,omitempty"`
 	ExternalRef        string   `json:"external_ref,omitempty"`  // Link to external issue trackers
 	EstimatedMinutes   *int     `json:"estimated_minutes,omitempty"` // Time estimate in minutes
 	Labels             []string `json:"labels,omitempty"`
 	Dependencies       []string `json:"dependencies,omitempty"`
+	// Waits-for dependencies
+	WaitsFor     string `json:"waits_for,omitempty"`      // Spawner issue ID to wait for
+	WaitsForGate string `json:"waits_for_gate,omitempty"` // Gate type: all-children or any-children
+	// Messaging fields
+	Sender    string `json:"sender,omitempty"`    // Who sent this (for messages)
+	Ephemeral bool   `json:"ephemeral,omitempty"` // If true, not exported to JSONL; bulk-deleted when closed
+	RepliesTo string `json:"replies_to,omitempty"` // Issue ID for conversation threading
+	// ID generation
+	IDPrefix  string `json:"id_prefix,omitempty"`  // Override prefix for ID generation (mol, eph, etc.)
+	CreatedBy string `json:"created_by,omitempty"` // Who created the issue
+	// Molecule type (for swarm coordination)
+	MolType string `json:"mol_type,omitempty"` // swarm, patrol, or work (default)
+	// Agent identity fields (only valid when IssueType == "agent")
+	RoleType string `json:"role_type,omitempty"` // polecat|crew|witness|refinery|mayor|deacon
+	Rig      string `json:"rig,omitempty"`       // Rig name (empty for town-level agents)
+	// Event fields (only valid when IssueType == "event")
+	EventCategory string `json:"event_category,omitempty"` // Namespaced category (e.g., patrol.muted, agent.started)
+	EventActor    string `json:"event_actor,omitempty"`    // Entity URI who caused this event
+	EventTarget   string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
+	EventPayload  string `json:"event_payload,omitempty"`  // Event-specific JSON data
+	// Time-based scheduling fields (GH#820)
+	DueAt      string `json:"due_at,omitempty"`      // Relative or ISO format due date
+	DeferUntil string `json:"defer_until,omitempty"` // Relative or ISO format defer date
 }
 
 // UpdateArgs represents arguments for the update operation
@@ -86,15 +126,65 @@ type UpdateArgs struct {
 	Assignee           *string  `json:"assignee,omitempty"`
 	ExternalRef        *string  `json:"external_ref,omitempty"` // Link to external issue trackers
 	EstimatedMinutes   *int     `json:"estimated_minutes,omitempty"` // Time estimate in minutes
+	IssueType          *string  `json:"issue_type,omitempty"`        // Issue type (bug|feature|task|epic|chore)
 	AddLabels          []string `json:"add_labels,omitempty"`
 	RemoveLabels       []string `json:"remove_labels,omitempty"`
 	SetLabels          []string `json:"set_labels,omitempty"`
+	// Messaging fields
+	Sender    *string `json:"sender,omitempty"`    // Who sent this (for messages)
+	Ephemeral *bool   `json:"ephemeral,omitempty"` // If true, not exported to JSONL; bulk-deleted when closed
+	RepliesTo *string `json:"replies_to,omitempty"` // Issue ID for conversation threading
+	// Graph link fields
+	RelatesTo    *string `json:"relates_to,omitempty"`    // JSON array of related issue IDs
+	DuplicateOf  *string `json:"duplicate_of,omitempty"`  // Canonical issue ID if duplicate
+	SupersededBy *string `json:"superseded_by,omitempty"` // Replacement issue ID if obsolete
+	// Pinned field
+	Pinned *bool `json:"pinned,omitempty"` // If true, issue is a persistent context marker
+	// Reparenting field
+	Parent *string `json:"parent,omitempty"` // New parent issue ID (reparents the issue)
+	// Agent slot fields
+	HookBead *string `json:"hook_bead,omitempty"` // Current work on agent's hook (0..1)
+	RoleBead *string `json:"role_bead,omitempty"` // Role definition bead for agent
+	// Agent state fields
+	AgentState   *string `json:"agent_state,omitempty"`   // Agent state (idle|running|stuck|stopped|dead)
+	LastActivity *bool   `json:"last_activity,omitempty"` // If true, update last_activity to now
+	// Agent identity fields
+	RoleType *string `json:"role_type,omitempty"` // polecat|crew|witness|refinery|mayor|deacon
+	Rig      *string `json:"rig,omitempty"`       // Rig name (empty for town-level agents)
+	// Event fields (only valid when IssueType == "event")
+	EventCategory *string `json:"event_category,omitempty"` // Namespaced category (e.g., patrol.muted, agent.started)
+	EventActor    *string `json:"event_actor,omitempty"`    // Entity URI who caused this event
+	EventTarget   *string `json:"event_target,omitempty"`   // Entity URI or bead ID affected
+	EventPayload  *string `json:"event_payload,omitempty"`  // Event-specific JSON data
+	// Work queue claim operation
+	Claim bool `json:"claim,omitempty"` // If true, atomically claim issue (set assignee+status, fail if already claimed)
+	// Time-based scheduling fields (GH#820)
+	DueAt      *string `json:"due_at,omitempty"`      // Relative or ISO format due date
+	DeferUntil *string `json:"defer_until,omitempty"` // Relative or ISO format defer date
 }
 
 // CloseArgs represents arguments for the close operation
 type CloseArgs struct {
-	ID     string `json:"id"`
-	Reason string `json:"reason,omitempty"`
+	ID          string `json:"id"`
+	Reason      string `json:"reason,omitempty"`
+	Session     string `json:"session,omitempty"`      // Claude Code session ID that closed this issue
+	SuggestNext bool   `json:"suggest_next,omitempty"` // Return newly unblocked issues (GH#679)
+}
+
+// CloseResult is returned when SuggestNext is true (GH#679)
+// When SuggestNext is false, just the closed issue is returned for backward compatibility
+type CloseResult struct {
+	Closed    *types.Issue   `json:"closed"`              // The issue that was closed
+	Unblocked []*types.Issue `json:"unblocked,omitempty"` // Issues newly unblocked by closing
+}
+
+// DeleteArgs represents arguments for the delete operation
+type DeleteArgs struct {
+	IDs     []string `json:"ids"`               // Issue IDs to delete
+	Force   bool     `json:"force,omitempty"`   // Force deletion without confirmation
+	DryRun  bool     `json:"dry_run,omitempty"` // Preview mode
+	Cascade bool     `json:"cascade,omitempty"` // Recursively delete dependents
+	Reason  string   `json:"reason,omitempty"`  // Reason for deletion
 }
 
 // ListArgs represents arguments for the list operation
@@ -131,6 +221,35 @@ type ListArgs struct {
 	// Priority range
 	PriorityMin *int `json:"priority_min,omitempty"`
 	PriorityMax *int `json:"priority_max,omitempty"`
+
+	// Pinned filtering
+	Pinned *bool `json:"pinned,omitempty"`
+
+	// Template filtering
+	IncludeTemplates bool `json:"include_templates,omitempty"`
+
+	// Parent filtering
+	ParentID string `json:"parent_id,omitempty"`
+
+	// Ephemeral filtering
+	Ephemeral *bool `json:"ephemeral,omitempty"`
+
+	// Molecule type filtering
+	MolType string `json:"mol_type,omitempty"`
+
+	// Status exclusion (for default non-closed behavior, GH#788)
+	ExcludeStatus []string `json:"exclude_status,omitempty"`
+
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	ExcludeTypes []string `json:"exclude_types,omitempty"`
+
+	// Time-based scheduling filters (GH#820)
+	Deferred    bool   `json:"deferred,omitempty"`     // Filter issues with defer_until set
+	DeferAfter  string `json:"defer_after,omitempty"`  // ISO 8601 format
+	DeferBefore string `json:"defer_before,omitempty"` // ISO 8601 format
+	DueAfter    string `json:"due_after,omitempty"`    // ISO 8601 format
+	DueBefore   string `json:"due_before,omitempty"`   // ISO 8601 format
+	Overdue     bool   `json:"overdue,omitempty"`      // Filter issues where due_at < now
 }
 
 // CountArgs represents arguments for the count operation
@@ -186,10 +305,19 @@ type ReadyArgs struct {
 	Assignee   string   `json:"assignee,omitempty"`
 	Unassigned bool     `json:"unassigned,omitempty"`
 	Priority   *int     `json:"priority,omitempty"`
+	Type       string   `json:"type,omitempty"`
 	Limit      int      `json:"limit,omitempty"`
 	SortPolicy string   `json:"sort_policy,omitempty"`
 	Labels     []string `json:"labels,omitempty"`
 	LabelsAny  []string `json:"labels_any,omitempty"`
+	ParentID        string   `json:"parent_id,omitempty"`        // Filter to descendants of this bead/epic
+	MolType         string   `json:"mol_type,omitempty"`         // Filter by molecule type: swarm, patrol, or work
+	IncludeDeferred bool     `json:"include_deferred,omitempty"` // Include issues with future defer_until (GH#820)
+}
+
+// BlockedArgs represents arguments for the blocked operation
+type BlockedArgs struct {
+	ParentID string `json:"parent_id,omitempty"` // Filter to descendants of this bead/epic
 }
 
 // StaleArgs represents arguments for the stale command
@@ -265,6 +393,13 @@ type StatusResponse struct {
 	LastActivityTime     string  `json:"last_activity_time"`       // ISO 8601 timestamp of last request
 	ExclusiveLockActive  bool    `json:"exclusive_lock_active"`    // Whether an exclusive lock is held
 	ExclusiveLockHolder  string  `json:"exclusive_lock_holder,omitempty"` // Lock holder name if active
+	// Daemon configuration
+	AutoCommit   bool   `json:"auto_commit"`            // Whether auto-commit is enabled
+	AutoPush     bool   `json:"auto_push"`              // Whether auto-push is enabled
+	AutoPull     bool   `json:"auto_pull"`              // Whether auto-pull is enabled (periodic remote sync)
+	LocalMode    bool   `json:"local_mode"`             // Whether running in local-only mode (no git)
+	SyncInterval string `json:"sync_interval"`          // Sync interval (e.g., "5s")
+	DaemonMode   string `json:"daemon_mode"`            // Sync mode: "poll" or "events"
 }
 
 // HealthResponse is the response for a health check operation
@@ -367,4 +502,129 @@ type ImportArgs struct {
 // GetMutationsArgs represents arguments for retrieving recent mutations
 type GetMutationsArgs struct {
 	Since int64 `json:"since"` // Unix timestamp in milliseconds (0 for all recent)
+}
+
+// Gate operations
+
+// GateCreateArgs represents arguments for creating a gate
+type GateCreateArgs struct {
+	Title     string        `json:"title"`
+	AwaitType string        `json:"await_type"` // gh:run, gh:pr, timer, human, mail
+	AwaitID   string        `json:"await_id"`   // ID/value for the await type
+	Timeout   time.Duration `json:"timeout"`    // Timeout duration
+	Waiters   []string      `json:"waiters"`    // Mail addresses to notify when gate clears
+}
+
+// GateCreateResult represents the result of creating a gate
+type GateCreateResult struct {
+	ID string `json:"id"` // Created gate ID
+}
+
+// GateListArgs represents arguments for listing gates
+type GateListArgs struct {
+	All bool `json:"all"` // Include closed gates
+}
+
+// GateShowArgs represents arguments for showing a gate
+type GateShowArgs struct {
+	ID string `json:"id"` // Gate ID (partial or full)
+}
+
+// GateCloseArgs represents arguments for closing a gate
+type GateCloseArgs struct {
+	ID     string `json:"id"`               // Gate ID (partial or full)
+	Reason string `json:"reason,omitempty"` // Close reason
+}
+
+// GateWaitArgs represents arguments for adding waiters to a gate
+type GateWaitArgs struct {
+	ID      string   `json:"id"`      // Gate ID (partial or full)
+	Waiters []string `json:"waiters"` // Additional waiters to add
+}
+
+// GateWaitResult represents the result of adding waiters
+type GateWaitResult struct {
+	AddedCount int `json:"added_count"` // Number of new waiters added
+}
+
+// GetWorkerStatusArgs represents arguments for retrieving worker status
+type GetWorkerStatusArgs struct {
+	// Assignee filters to a specific worker (optional, empty = all workers)
+	Assignee string `json:"assignee,omitempty"`
+}
+
+// WorkerStatus represents the status of a single worker and their current work
+type WorkerStatus struct {
+	Assignee      string `json:"assignee"`                 // Worker identifier
+	MoleculeID    string `json:"molecule_id,omitempty"`    // Parent molecule/epic ID (if working on a step)
+	MoleculeTitle string `json:"molecule_title,omitempty"` // Parent molecule/epic title
+	CurrentStep   int    `json:"current_step,omitempty"`   // Current step number (1-indexed)
+	TotalSteps    int    `json:"total_steps,omitempty"`    // Total number of steps in molecule
+	StepID        string `json:"step_id,omitempty"`        // Current step issue ID
+	StepTitle     string `json:"step_title,omitempty"`     // Current step issue title
+	LastActivity  string `json:"last_activity"`            // ISO 8601 timestamp of last update
+	Status        string `json:"status"`                   // Current work status (in_progress, blocked, etc.)
+}
+
+// GetWorkerStatusResponse is the response for get_worker_status operation
+type GetWorkerStatusResponse struct {
+	Workers []WorkerStatus `json:"workers"`
+}
+
+// GetMoleculeProgressArgs represents arguments for the get_molecule_progress operation
+type GetMoleculeProgressArgs struct {
+	MoleculeID string `json:"molecule_id"` // The ID of the molecule (parent issue)
+}
+
+// MoleculeStep represents a single step within a molecule
+type MoleculeStep struct {
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Status    string  `json:"status"`     // "done", "current", "ready", "blocked"
+	StartTime *string `json:"start_time"` // ISO 8601 timestamp when step was created
+	CloseTime *string `json:"close_time"` // ISO 8601 timestamp when step was closed (if done)
+}
+
+// MoleculeProgress represents the progress of a molecule (parent issue with steps)
+type MoleculeProgress struct {
+	MoleculeID string         `json:"molecule_id"`
+	Title      string         `json:"title"`
+	Assignee   string         `json:"assignee"`
+	Steps      []MoleculeStep `json:"steps"`
+}
+
+// GetConfigArgs represents arguments for getting daemon config
+type GetConfigArgs struct {
+	Key string `json:"key"` // Config key to retrieve (e.g., "issue_prefix")
+}
+
+// GetConfigResponse represents the response from get_config operation
+type GetConfigResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// MolStaleArgs represents arguments for the mol stale operation
+type MolStaleArgs struct {
+	BlockingOnly   bool `json:"blocking_only"`   // Only show molecules blocking other work
+	UnassignedOnly bool `json:"unassigned_only"` // Only show unassigned molecules
+	ShowAll        bool `json:"show_all"`        // Include molecules with 0 children
+}
+
+// StaleMolecule holds info about a stale molecule (for RPC response)
+type StaleMolecule struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	TotalChildren  int      `json:"total_children"`
+	ClosedChildren int      `json:"closed_children"`
+	Assignee       string   `json:"assignee,omitempty"`
+	BlockingIssues []string `json:"blocking_issues,omitempty"`
+	BlockingCount  int      `json:"blocking_count"`
+}
+
+// MolStaleResponse holds the result of the mol stale operation
+type MolStaleResponse struct {
+	StaleMolecules []*StaleMolecule `json:"stale_molecules"`
+	TotalCount     int              `json:"total_count"`
+	BlockingCount  int              `json:"blocking_count"`
 }

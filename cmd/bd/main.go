@@ -9,7 +9,6 @@ import (
 	"runtime/pprof"
 	"runtime/trace"
 	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,39 +17,13 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/hooks"
+	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/memory"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/utils"
-)
-
-// DaemonStatus captures daemon connection state for the current command
-type DaemonStatus struct {
-	Mode               string `json:"mode"` // "daemon" or "direct"
-	Connected          bool   `json:"connected"`
-	Degraded           bool   `json:"degraded"`
-	SocketPath         string `json:"socket_path,omitempty"`
-	AutoStartEnabled   bool   `json:"auto_start_enabled"`
-	AutoStartAttempted bool   `json:"auto_start_attempted"`
-	AutoStartSucceeded bool   `json:"auto_start_succeeded"`
-	FallbackReason     string `json:"fallback_reason,omitempty"` // "none","flag_no_daemon","connect_failed","health_failed","auto_start_disabled","auto_start_failed"
-	Detail             string `json:"detail,omitempty"`          // short diagnostic
-	Health             string `json:"health,omitempty"`          // "healthy","degraded","unhealthy"
-}
-
-// Fallback reason constants
-const (
-	FallbackNone              = "none"
-	FallbackFlagNoDaemon      = "flag_no_daemon"
-	FallbackConnectFailed     = "connect_failed"
-	FallbackHealthFailed      = "health_failed"
-	cmdDaemon                 = "daemon"
-	cmdImport                 = "import"
-	statusHealthy             = "healthy"
-	FallbackAutoStartDisabled = "auto_start_disabled"
-	FallbackAutoStartFailed   = "auto_start_failed"
-	FallbackDaemonUnsupported = "daemon_unsupported"
 )
 
 var (
@@ -69,18 +42,18 @@ var (
 	rootCancel context.CancelFunc
 
 	// Auto-flush state
-	autoFlushEnabled  = true  // Can be disabled with --no-auto-flush
-	isDirty           = false // Tracks if DB has changes needing export (used by legacy code)
-	needsFullExport   = false // Set to true when IDs change (used by legacy code)
+	autoFlushEnabled  = true // Can be disabled with --no-auto-flush
 	flushMutex        sync.Mutex
-	flushTimer        *time.Timer // DEPRECATED: Use flushManager instead
-	storeMutex        sync.Mutex  // Protects store access from background goroutine
-	storeActive       = false     // Tracks if store is available
-	flushFailureCount = 0         // Consecutive flush failures
-	lastFlushError    error       // Last flush error for debugging
+	storeMutex        sync.Mutex // Protects store access from background goroutine
+	storeActive       = false    // Tracks if store is available
+	flushFailureCount = 0        // Consecutive flush failures
+	lastFlushError    error      // Last flush error for debugging
 
-	// Auto-flush manager (replaces timer-based approach to fix bd-52)
+	// Auto-flush manager (event-driven, fixes race condition)
 	flushManager *FlushManager
+
+	// Hook runner for extensibility
+	hookRunner *hooks.Runner
 
 	// skipFinalFlush is set by sync command when sync.branch mode completes successfully.
 	// This prevents PersistentPostRun from re-exporting and dirtying the working directory.
@@ -89,19 +62,19 @@ var (
 	// Auto-import state
 	autoImportEnabled = true // Can be disabled with --no-auto-import
 
-	// Version upgrade tracking (bd-loka)
+	// Version upgrade tracking
 	versionUpgradeDetected = false // Set to true if bd version changed since last run
 	previousVersion        = ""    // The last bd version user had (empty = first run or unknown)
 	upgradeAcknowledged    = false // Set to true after showing upgrade notification once per session
 )
-
 var (
-	noAutoFlush  bool
-	noAutoImport bool
-	sandboxMode  bool
-	allowStale   bool // Use --allow-stale: skip staleness check (emergency escape hatch)
-	noDb         bool // Use --no-db mode: load from JSONL, write back after each command
-	readonlyMode bool // Read-only mode: block write operations (for worker sandboxes)
+	noAutoFlush    bool
+	noAutoImport   bool
+	sandboxMode    bool
+	allowStale     bool          // Use --allow-stale: skip staleness check (emergency escape hatch)
+	noDb           bool          // Use --no-db mode: load from JSONL, write back after each command
+	readonlyMode   bool          // Read-only mode: block write operations (for worker sandboxes)
+	lockTimeout    time.Duration // SQLite busy_timeout (default 30s, 0 = fail immediately)
 	profileEnabled bool
 	profileFile    *os.File
 	traceFile      *os.File
@@ -109,11 +82,41 @@ var (
 	quietFlag      bool // Suppress non-essential output
 )
 
+// readOnlyCommands lists commands that only read from the database.
+// These commands open SQLite in read-only mode to avoid modifying the
+// database file (which breaks file watchers). See GH#804.
+var readOnlyCommands = map[string]bool{
+	"list":       true,
+	"ready":      true,
+	"show":       true,
+	"stats":      true,
+	"blocked":    true,
+	"count":      true,
+	"search":     true,
+	"graph":      true,
+	"duplicates": true,
+	"comments":   true, // list comments (not add)
+	"export":     true, // export only reads
+}
+
+// isReadOnlyCommand returns true if the command only reads from the database.
+// This is used to open SQLite in read-only mode, preventing file modifications
+// that would trigger file watchers. See GH#804.
+func isReadOnlyCommand(cmdName string) bool {
+	return readOnlyCommands[cmdName]
+}
+
 func init() {
 	// Initialize viper configuration
 	if err := config.Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
 	}
+
+	// Add command groups for organized help output
+	rootCmd.AddGroup(
+		&cobra.Group{ID: GroupMaintenance, Title: "Maintenance:"},
+		&cobra.Group{ID: GroupIntegrations, Title: "Integrations & Advanced:"},
+	)
 
 	// Register persistent flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
@@ -126,12 +129,29 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&allowStale, "allow-stale", false, "Allow operations on potentially stale data (skip staleness check)")
 	rootCmd.PersistentFlags().BoolVar(&noDb, "no-db", false, "Use no-db mode: load from JSONL, no SQLite")
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
+	rootCmd.PersistentFlags().DurationVar(&lockTimeout, "lock-timeout", 30*time.Second, "SQLite busy timeout (0 = fail immediately if locked)")
 	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
 	rootCmd.PersistentFlags().BoolVarP(&quietFlag, "quiet", "q", false, "Suppress non-essential output (errors only)")
 
 	// Add --version flag to root command (same behavior as version subcommand)
 	rootCmd.Flags().BoolP("version", "V", false, "Print version information")
+
+	// Command groups for organized help output (Tufte-inspired)
+	rootCmd.AddGroup(&cobra.Group{ID: "issues", Title: "Working With Issues:"})
+	rootCmd.AddGroup(&cobra.Group{ID: "views", Title: "Views & Reports:"})
+	rootCmd.AddGroup(&cobra.Group{ID: "deps", Title: "Dependencies & Structure:"})
+	rootCmd.AddGroup(&cobra.Group{ID: "sync", Title: "Sync & Data:"})
+	rootCmd.AddGroup(&cobra.Group{ID: "setup", Title: "Setup & Configuration:"})
+	// NOTE: Many maintenance commands (clean, cleanup, compact, validate, repair-deps)
+	// should eventually be consolidated into 'bd doctor' and 'bd doctor --fix' to simplify
+	// the user experience. The doctor command can detect issues and offer fixes interactively.
+	rootCmd.AddGroup(&cobra.Group{ID: "maint", Title: "Maintenance:"})
+	rootCmd.AddGroup(&cobra.Group{ID: "advanced", Title: "Integrations & Advanced:"})
+
+	// Custom help function with semantic coloring (Tufte-inspired)
+	// Note: Usage output (shown on errors) is not styled to avoid recursion issues
+	rootCmd.SetHelpFunc(colorizedHelpFunc)
 }
 
 var rootCmd = &cobra.Command{
@@ -148,8 +168,14 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help()
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Initialize CommandContext to hold runtime state (replaces scattered globals)
+		initCommandContext()
+
 		// Set up signal-aware context for graceful cancellation
 		rootCtx, rootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+		// Signal orchestrator daemon about bd activity (best-effort, for exponential backoff)
+		defer signalOrchestratorActivity()
 
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
@@ -159,31 +185,96 @@ var rootCmd = &cobra.Command{
 		// Priority: flags > viper (config file + env vars) > defaults
 		// Do this BEFORE early-return so init/version/help respect config
 
+		// Track flag overrides for notification (only in verbose mode)
+		flagOverrides := make(map[string]struct {
+			Value  interface{}
+			WasSet bool
+		})
+
 		// If flag wasn't explicitly set, use viper value
 		if !cmd.Flags().Changed("json") {
 			jsonOutput = config.GetBool("json")
+		} else {
+			flagOverrides["json"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{jsonOutput, true}
 		}
 		if !cmd.Flags().Changed("no-daemon") {
 			noDaemon = config.GetBool("no-daemon")
+		} else {
+			flagOverrides["no-daemon"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{noDaemon, true}
 		}
 		if !cmd.Flags().Changed("no-auto-flush") {
 			noAutoFlush = config.GetBool("no-auto-flush")
+		} else {
+			flagOverrides["no-auto-flush"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{noAutoFlush, true}
 		}
 		if !cmd.Flags().Changed("no-auto-import") {
 			noAutoImport = config.GetBool("no-auto-import")
+		} else {
+			flagOverrides["no-auto-import"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{noAutoImport, true}
 		}
 		if !cmd.Flags().Changed("no-db") {
 			noDb = config.GetBool("no-db")
+		} else {
+			flagOverrides["no-db"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{noDb, true}
 		}
 		if !cmd.Flags().Changed("readonly") {
 			readonlyMode = config.GetBool("readonly")
+		} else {
+			flagOverrides["readonly"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{readonlyMode, true}
+		}
+		if !cmd.Flags().Changed("lock-timeout") {
+			lockTimeout = config.GetDuration("lock-timeout")
+		} else {
+			flagOverrides["lock-timeout"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{lockTimeout, true}
 		}
 		if !cmd.Flags().Changed("db") && dbPath == "" {
 			dbPath = config.GetString("db")
+		} else if cmd.Flags().Changed("db") {
+			flagOverrides["db"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{dbPath, true}
 		}
 		if !cmd.Flags().Changed("actor") && actor == "" {
 			actor = config.GetString("actor")
+		} else if cmd.Flags().Changed("actor") {
+			flagOverrides["actor"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{actor, true}
 		}
+
+		// Check for and log configuration overrides (only in verbose mode)
+		if verboseFlag {
+			overrides := config.CheckOverrides(flagOverrides)
+			for _, override := range overrides {
+				config.LogOverride(override)
+			}
+		}
+
+		// Protect forks from accidentally committing upstream issue database
+		ensureForkProtection()
 
 		// Performance profiling setup
 		// When --profile is enabled, force direct mode to capture actual database operations
@@ -210,11 +301,15 @@ var rootCmd = &cobra.Command{
 			"doctor",
 			"fish",
 			"help",
+			"hooks",
+			"human",
 			"init",
 			"merge",
+			"onboard",
 			"powershell",
 			"prime",
 			"quickstart",
+			"repair",
 			"setup",
 			"version",
 			"zsh",
@@ -231,12 +326,17 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
+		// Skip for root command with no subcommand (just shows help)
+		if cmd.Parent() == nil && cmdName == "bd" {
+			return
+		}
+
 		// Also skip for --version flag on root command (cmdName would be "bd")
 		if v, _ := cmd.Flags().GetBool("version"); v {
 			return
 		}
 
-		// Auto-detect sandboxed environment (bd-u3t: Phase 2 for GH #353)
+		// Auto-detect sandboxed environment (Phase 2 for GH #353)
 		// Only auto-enable if user hasn't explicitly set --sandbox or --no-daemon
 		if !cmd.Flags().Changed("sandbox") && !cmd.Flags().Changed("no-daemon") {
 			if isSandboxed() {
@@ -250,6 +350,10 @@ var rootCmd = &cobra.Command{
 			noDaemon = true
 			noAutoFlush = true
 			noAutoImport = true
+			// Use shorter lock timeout in sandbox mode unless explicitly set
+			if !cmd.Flags().Changed("lock-timeout") {
+				lockTimeout = 100 * time.Millisecond
+			}
 		}
 
 		// Force direct mode for human-only interactive commands
@@ -292,7 +396,7 @@ var rootCmd = &cobra.Command{
 			if foundDB := beads.FindDatabasePath(); foundDB != "" {
 				dbPath = foundDB
 			} else {
-				// No database found - check if this is JSONL-only mode (bd-5kj)
+				// No database found - check if this is JSONL-only mode
 				beadsDir := beads.FindBeadsDir()
 				if beadsDir != "" {
 					jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
@@ -303,7 +407,7 @@ var rootCmd = &cobra.Command{
 						jsonlExists = true
 					}
 
-					// Use proper YAML parsing to detect no-db mode (bd-r6k2)
+					// Use proper YAML parsing to detect no-db mode
 					isNoDbMode := isNoDbModeConfigured(beadsDir)
 
 					// If JSONL-only mode is configured, auto-enable it
@@ -313,9 +417,11 @@ var rootCmd = &cobra.Command{
 							fmt.Fprintf(os.Stderr, "Error initializing JSONL-only mode: %v\n", err)
 							os.Exit(1)
 						}
-						// Set actor from flag, viper, or env
+						// Set actor for audit trail
 						if actor == "" {
-							if user := os.Getenv("USER"); user != "" {
+							if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+								actor = bdActor
+							} else if user := os.Getenv("USER"); user != "" {
 								actor = user
 							} else {
 								actor = "unknown"
@@ -329,8 +435,25 @@ var rootCmd = &cobra.Command{
 				// - import: auto-initializes database if missing
 				// - setup: creates editor integration files (no DB needed)
 				if cmd.Name() != "import" && cmd.Name() != "setup" {
-					// No database found - error out instead of falling back to ~/.beads
+					// No database found - provide context-aware error message
 					fmt.Fprintf(os.Stderr, "Error: no beads database found\n")
+
+					// Check if JSONL exists without no-db mode configured
+					if beadsDir != "" {
+						jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+						if _, err := os.Stat(jsonlPath); err == nil {
+							// JSONL exists but no-db mode not configured
+							fmt.Fprintf(os.Stderr, "\nFound JSONL file: %s\n", jsonlPath)
+							fmt.Fprintf(os.Stderr, "This looks like a fresh clone or JSONL-only project.\n\n")
+							fmt.Fprintf(os.Stderr, "Options:\n")
+							fmt.Fprintf(os.Stderr, "  • Run 'bd init' to create database and import issues\n")
+							fmt.Fprintf(os.Stderr, "  • Use 'bd --no-db %s' for JSONL-only mode\n", cmd.Name())
+							fmt.Fprintf(os.Stderr, "  • Add 'no-db: true' to .beads/config.yaml for permanent JSONL-only mode\n")
+							os.Exit(1)
+						}
+					}
+
+					// Generic error - no beads directory or JSONL found
 					fmt.Fprintf(os.Stderr, "Hint: run 'bd init' to create a database in the current directory\n")
 					fmt.Fprintf(os.Stderr, "      or use 'bd --no-db' to work with JSONL only (no SQLite)\n")
 					fmt.Fprintf(os.Stderr, "      or set BEADS_DIR to point to your .beads directory\n")
@@ -341,20 +464,19 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Set actor from flag, viper (env), or default
-		// Priority: --actor flag > viper (config + BD_ACTOR env) > USER env > "unknown"
-		// Note: Viper handles BD_ACTOR automatically via AutomaticEnv()
+		// Set actor for audit trail
+		// Priority: --actor flag > BD_ACTOR env > USER env > "unknown"
 		if actor == "" {
-			// Viper already populated from config file or BD_ACTOR env
-			// Fall back to USER env if still empty
-			if user := os.Getenv("USER"); user != "" {
+			if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+				actor = bdActor
+			} else if user := os.Getenv("USER"); user != "" {
 				actor = user
 			} else {
 				actor = "unknown"
 			}
 		}
 
-		// Track bd version changes (bd-loka)
+		// Track bd version changes
 		// Best-effort tracking - failures are silent
 		trackBdVersion()
 
@@ -369,10 +491,35 @@ var rootCmd = &cobra.Command{
 			FallbackReason:   FallbackNone,
 		}
 
-		// Try to connect to daemon first (unless --no-daemon flag is set)
+		// Doctor should always run in direct mode. It's specifically used to diagnose and
+		// repair daemon/DB issues, so attempting to connect to (or auto-start) a daemon
+		// can add noise and timeouts.
+		if cmd.Name() == "doctor" {
+			noDaemon = true
+		}
+
+		// Wisp operations auto-bypass daemon
+		// Wisps are ephemeral (Ephemeral=true) and never exported to JSONL,
+		// so daemon can't help anyway. This reduces friction in wisp workflows.
+		if isWispOperation(cmd, args) {
+			noDaemon = true
+			daemonStatus.FallbackReason = FallbackWispOperation
+			debug.Logf("wisp operation detected, using direct mode")
+		}
+
+		// Try to connect to daemon first (unless --no-daemon flag is set or worktree safety check fails)
 		if noDaemon {
-			daemonStatus.FallbackReason = FallbackFlagNoDaemon
-			debug.Logf("--no-daemon flag set, using direct mode")
+			// Only set FallbackFlagNoDaemon if not already set by auto-bypass logic
+			if daemonStatus.FallbackReason == FallbackNone {
+				daemonStatus.FallbackReason = FallbackFlagNoDaemon
+				debug.Logf("--no-daemon flag set, using direct mode")
+			}
+		} else if shouldDisableDaemonForWorktree() {
+			// In a git worktree without sync-branch configured - daemon is unsafe
+			// because all worktrees share the same .beads directory and the daemon
+			// would commit to whatever branch its working directory has checked out.
+			daemonStatus.FallbackReason = FallbackWorktreeSafety
+			debug.Logf("git worktree detected without sync-branch, using direct mode for safety")
 		} else {
 			// Attempt daemon connection
 			client, err := rpc.TryConnect(socketPath)
@@ -403,6 +550,7 @@ var rootCmd = &cobra.Command{
 								}
 								health, healthErr = client.Health()
 								if healthErr == nil && health.Status == statusHealthy {
+									client.SetActor(actor)
 									daemonClient = client
 									daemonStatus.Mode = cmdDaemon
 									daemonStatus.Connected = true
@@ -420,6 +568,7 @@ var rootCmd = &cobra.Command{
 							health.Version, Version)
 					} else {
 						// Daemon is healthy and compatible - use it
+						client.SetActor(actor)
 						daemonClient = client
 						daemonStatus.Mode = cmdDaemon
 						daemonStatus.Connected = true
@@ -470,6 +619,7 @@ var rootCmd = &cobra.Command{
 						// Check health of auto-started daemon
 						health, healthErr := client.Health()
 						if healthErr == nil && health.Status == statusHealthy {
+							client.SetActor(actor)
 							daemonClient = client
 							daemonStatus.Mode = cmdDaemon
 							daemonStatus.Connected = true
@@ -531,16 +681,35 @@ var rootCmd = &cobra.Command{
 			debug.Logf("using direct mode (reason: %s)", daemonStatus.FallbackReason)
 		}
 
-		// Auto-migrate database on version bump (bd-jgxi)
+		// Check if this is a read-only command (GH#804)
+		// Read-only commands open SQLite in read-only mode to avoid modifying
+		// the database file (which breaks file watchers).
+		useReadOnly := isReadOnlyCommand(cmd.Name())
+
+		// Auto-migrate database on version bump
+		// Skip for read-only commands - they can't write anyway
 		// Do this AFTER daemon check but BEFORE opening database for main operation
 		// This ensures: 1) no daemon has DB open, 2) we don't open DB twice
-		autoMigrateOnVersionBump(dbPath)
+		if !useReadOnly {
+			autoMigrateOnVersionBump(dbPath)
+		}
 
 		// Fall back to direct storage access
 		var err error
-		store, err = sqlite.New(rootCtx, dbPath)
+		if useReadOnly {
+			// Read-only mode: prevents file modifications (GH#804)
+			store, err = sqlite.NewReadOnlyWithTimeout(rootCtx, dbPath, lockTimeout)
+			if err != nil {
+				// If read-only fails (e.g., DB doesn't exist), fall back to read-write
+				// This handles the case where user runs "bd list" before "bd init"
+				debug.Logf("read-only open failed, falling back to read-write: %v", err)
+				store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+			}
+		} else {
+			store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+		}
 		if err != nil {
-			// Check for fresh clone scenario (bd-dmb)
+			// Check for fresh clone scenario
 			beadsDir := filepath.Dir(dbPath)
 			if handleFreshCloneError(err, beadsDir) {
 				os.Exit(1)
@@ -554,20 +723,33 @@ var rootCmd = &cobra.Command{
 		storeActive = true
 		storeMutex.Unlock()
 
-		// Initialize flush manager (fixes bd-52: race condition in auto-flush)
+		// Initialize flush manager (fixes race condition in auto-flush)
+		// Skip FlushManager creation in sandbox mode - no background goroutines needed
+		// (improves Windows exit behavior and container scenarios)
+		// Skip for read-only commands - they don't write anything (GH#804)
 		// For in-process test scenarios where commands run multiple times,
 		// we create a new manager each time. Shutdown() is idempotent so
 		// PostRun can safely shutdown whichever manager is active.
-		flushManager = NewFlushManager(autoFlushEnabled, getDebounceDuration())
+		if !sandboxMode && !useReadOnly {
+			flushManager = NewFlushManager(autoFlushEnabled, getDebounceDuration())
+		}
+
+		// Initialize hook runner
+		// dbPath is .beads/something.db, so workspace root is parent of .beads
+		if dbPath != "" {
+			beadsDir := filepath.Dir(dbPath)
+			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
+		}
 
 		// Warn if multiple databases detected in directory hierarchy
 		warnMultipleDatabases(dbPath)
 
 		// Auto-import if JSONL is newer than DB (e.g., after git pull)
 		// Skip for import command itself to avoid recursion
-		// Skip for delete command to prevent resurrection of deleted issues (bd-8kde)
-		// Skip if sync --dry-run to avoid modifying DB in dry-run mode (bd-191)
-		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled {
+		// Skip for delete command to prevent resurrection of deleted issues
+		// Skip if sync --dry-run to avoid modifying DB in dry-run mode
+		// Skip for read-only commands - they can't write anyway (GH#804)
+		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled && !useReadOnly {
 			// Check if this is sync command with --dry-run flag
 			if cmd.Name() == "sync" {
 				if dryRun, _ := cmd.Flags().GetBool("dry-run"); dryRun {
@@ -580,6 +762,25 @@ var rootCmd = &cobra.Command{
 				autoImportIfNewer()
 			}
 		}
+
+		// Load molecule templates from hierarchical catalog locations
+		// Templates are loaded after auto-import to ensure the database is up-to-date.
+		// Skip for import command to avoid conflicts during import operations.
+		if cmd.Name() != "import" && store != nil {
+			beadsDir := filepath.Dir(dbPath)
+			loader := molecules.NewLoader(store)
+			if result, err := loader.LoadAll(rootCtx, beadsDir); err != nil {
+				debug.Logf("warning: failed to load molecules: %v", err)
+			} else if result.Loaded > 0 {
+				debug.Logf("loaded %d molecules from %v", result.Loaded, result.Sources)
+			}
+		}
+
+		// Tips (including sync conflict proactive checks) are shown via maybeShowTip()
+		// after successful command execution, not in PreRun
+
+		// Sync all state to CommandContext for unified access
+		syncCommandContext()
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		// Handle --no-db mode: write memory storage back to JSONL
@@ -633,8 +834,14 @@ var rootCmd = &cobra.Command{
 		if store != nil {
 			_ = store.Close()
 		}
-		if profileFile != nil { pprof.StopCPUProfile(); _ = profileFile.Close() }
-		if traceFile != nil { trace.Stop(); _ = traceFile.Close() }
+		if profileFile != nil {
+			pprof.StopCPUProfile()
+			_ = profileFile.Close()
+		}
+		if traceFile != nil {
+			trace.Stop()
+			_ = traceFile.Close()
+		}
 
 		// Cancel the signal context to clean up resources
 		if rootCancel != nil {
@@ -643,73 +850,8 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-// getDebounceDuration returns the auto-flush debounce duration
-// Configurable via config file or BEADS_FLUSH_DEBOUNCE env var (e.g., "500ms", "10s")
-// Defaults to 5 seconds if not set or invalid
-
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
-}
-
-// isFreshCloneError checks if the error is due to a fresh clone scenario
-// where the database exists but is missing required config (like issue_prefix).
-// This happens when someone clones a repo with beads but needs to initialize.
-func isFreshCloneError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	// Check for the specific migration invariant error pattern
-	return strings.Contains(errStr, "post-migration validation failed") &&
-		strings.Contains(errStr, "required config key missing: issue_prefix")
-}
-
-// handleFreshCloneError displays a helpful message when a fresh clone is detected
-// and returns true if the error was handled (so caller should exit).
-// If not a fresh clone error, returns false and does nothing.
-func handleFreshCloneError(err error, beadsDir string) bool {
-	if !isFreshCloneError(err) {
-		return false
-	}
-
-	// Look for JSONL file in the .beads directory
-	jsonlPath := ""
-	issueCount := 0
-
-	if beadsDir != "" {
-		// Check for issues.jsonl (canonical) first, then beads.jsonl (legacy)
-		for _, name := range []string{"issues.jsonl", "beads.jsonl"} {
-			candidate := filepath.Join(beadsDir, name)
-			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
-				jsonlPath = candidate
-				// Count lines (approximately = issue count)
-				// #nosec G304 -- candidate is constructed from beadsDir which is .beads/
-				if data, readErr := os.ReadFile(candidate); readErr == nil {
-					for _, line := range strings.Split(string(data), "\n") {
-						if strings.TrimSpace(line) != "" {
-							issueCount++
-						}
-					}
-				}
-				break
-			}
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "Error: Database not initialized\n\n")
-	fmt.Fprintf(os.Stderr, "This appears to be a fresh clone or the database needs initialization.\n")
-
-	if jsonlPath != "" && issueCount > 0 {
-		fmt.Fprintf(os.Stderr, "Found: %s (%d issues)\n\n", jsonlPath, issueCount)
-		fmt.Fprintf(os.Stderr, "To initialize from the JSONL file, run:\n")
-		fmt.Fprintf(os.Stderr, "  bd import -i %s\n\n", jsonlPath)
-	} else {
-		fmt.Fprintf(os.Stderr, "\nTo initialize a new database, run:\n")
-		fmt.Fprintf(os.Stderr, "  bd init --prefix <your-prefix>\n\n")
-	}
-
-	fmt.Fprintf(os.Stderr, "For more information: bd init --help\n")
-	return true
 }

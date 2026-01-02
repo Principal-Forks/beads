@@ -712,6 +712,6 @@ This pattern scales from simple scripts to complex orchestrators like VC.
 
 ## See Also
 
-- [README.md](README.md) - Complete bd documentation
-- Run `bd quickstart` - Interactive tutorial
+- [README.md](../README.md) - Complete bd documentation
+- [QUICKSTART.md](QUICKSTART.md) - Quick start tutorial
 - Check out VC's implementation at `github.com/steveyegge/vc` for a real-world example

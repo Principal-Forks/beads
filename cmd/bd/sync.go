@@ -2,31 +2,23 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/deletions"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/syncbranch"
-	"github.com/steveyegge/beads/internal/types"
 )
 
 var syncCmd = &cobra.Command{
-	Use:   "sync",
-	Short: "Synchronize issues with git remote",
+	Use:     "sync",
+	GroupID: "sync",
+	Short:   "Synchronize issues with git remote",
 	Long: `Synchronize issues with git remote in a single operation:
 1. Export pending changes to JSONL
 2. Commit changes to git
@@ -57,8 +49,15 @@ Use --merge to merge the sync branch back to main branch.`,
 		fromMain, _ := cmd.Flags().GetBool("from-main")
 		noGitHistory, _ := cmd.Flags().GetBool("no-git-history")
 		squash, _ := cmd.Flags().GetBool("squash")
+		checkIntegrity, _ := cmd.Flags().GetBool("check")
+		acceptRebase, _ := cmd.Flags().GetBool("accept-rebase")
 
-		// bd-sync-corruption fix: Force direct mode for sync operations.
+		// If --no-push not explicitly set, check no-push config
+		if !cmd.Flags().Changed("no-push") {
+			noPush = config.GetBool("no-push")
+		}
+
+		// Force direct mode for sync operations.
 		// This prevents stale daemon SQLite connections from corrupting exports.
 		// If the daemon was running but its database file was deleted and recreated
 		// (e.g., during recovery), the daemon's SQLite connection points to the old
@@ -76,24 +75,27 @@ Use --merge to merge the sync branch back to main branch.`,
 		// Find JSONL path
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			fmt.Fprintf(os.Stderr, "Error: not in a bd workspace (no .beads directory found)\n")
-			os.Exit(1)
+			FatalError("not in a bd workspace (no .beads directory found)")
 		}
 
 		// If status mode, show diff between sync branch and main
 		if status {
 			if err := showSyncStatus(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
+			return
+		}
+
+		// If check mode, run pre-sync integrity checks
+		if checkIntegrity {
+			showSyncIntegrityCheck(ctx, jsonlPath)
 			return
 		}
 
 		// If merge mode, merge sync branch to main
 		if merge {
 			if err := mergeSyncBranch(ctx, dryRun); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			return
 		}
@@ -101,8 +103,7 @@ Use --merge to merge the sync branch back to main branch.`,
 		// If from-main mode, one-way sync from main branch (gt-ick9: ephemeral branch support)
 		if fromMain {
 			if err := doSyncFromMain(ctx, jsonlPath, renameOnImport, dryRun, noGitHistory); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			return
 		}
@@ -114,8 +115,7 @@ Use --merge to merge the sync branch back to main branch.`,
 			} else {
 				fmt.Println("→ Importing from JSONL...")
 				if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-					fmt.Fprintf(os.Stderr, "Error importing: %v\n", err)
-					os.Exit(1)
+					FatalError("importing: %v", err)
 				}
 				fmt.Println("✓ Import complete")
 			}
@@ -128,14 +128,13 @@ Use --merge to merge the sync branch back to main branch.`,
 				fmt.Println("→ [DRY RUN] Would export pending changes to JSONL")
 			} else {
 				if err := exportToJSONL(ctx, jsonlPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error exporting: %v\n", err)
-					os.Exit(1)
+					FatalError("exporting: %v", err)
 				}
 			}
 			return
 		}
 
-		// If squash mode, export to JSONL but skip git operations (bd-o2e)
+		// If squash mode, export to JSONL but skip git operations
 		// This accumulates changes for a single commit later
 		if squash {
 			if dryRun {
@@ -143,8 +142,7 @@ Use --merge to merge the sync branch back to main branch.`,
 			} else {
 				fmt.Println("→ Exporting pending changes to JSONL (squash mode)...")
 				if err := exportToJSONL(ctx, jsonlPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error exporting: %v\n", err)
-					os.Exit(1)
+					FatalError("exporting: %v", err)
 				}
 				fmt.Println("✓ Changes accumulated in JSONL")
 				fmt.Println("  Run 'bd sync' (without --squash) to commit all accumulated changes")
@@ -154,31 +152,36 @@ Use --merge to merge the sync branch back to main branch.`,
 
 		// Check if we're in a git repository
 		if !isGitRepo() {
-			fmt.Fprintf(os.Stderr, "Error: not in a git repository\n")
-			fmt.Fprintf(os.Stderr, "Hint: run 'git init' to initialize a repository\n")
-			os.Exit(1)
+			FatalErrorWithHint("not in a git repository", "run 'git init' to initialize a repository")
 		}
 
 		// Preflight: check for merge/rebase in progress
 		if inMerge, err := gitHasUnmergedPaths(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking git state: %v\n", err)
-			os.Exit(1)
+			FatalError("checking git state: %v", err)
 		} else if inMerge {
-			fmt.Fprintf(os.Stderr, "Error: unmerged paths or merge in progress\n")
-			fmt.Fprintf(os.Stderr, "Hint: resolve conflicts, run 'bd import' if needed, then 'bd sync' again\n")
-			os.Exit(1)
+			FatalErrorWithHint("unmerged paths or merge in progress", "resolve conflicts, run 'bd import' if needed, then 'bd sync' again")
+		}
+
+		// GH#638: Check sync.branch BEFORE upstream check
+		// When sync.branch is configured, we should use worktree-based sync even if
+		// the current branch has no upstream (e.g., detached HEAD in jj, git worktrees)
+		var hasSyncBranchConfig bool
+		if err := ensureStoreActive(); err == nil && store != nil {
+			if syncBranch, _ := syncbranch.Get(ctx, store); syncBranch != "" {
+				hasSyncBranchConfig = true
+			}
 		}
 
 		// Preflight: check for upstream tracking
 		// If no upstream, automatically switch to --from-main mode (gt-ick9: ephemeral branch support)
-		if !noPull && !gitHasUpstream() {
+		// GH#638: Skip this fallback if sync.branch is explicitly configured
+		if !noPull && !gitHasUpstream() && !hasSyncBranchConfig {
 			if hasGitRemote(ctx) {
 				// Remote exists but no upstream - use from-main mode
 				fmt.Println("→ No upstream configured, using --from-main mode")
 				// Force noGitHistory=true for auto-detected from-main mode (fixes #417)
 				if err := doSyncFromMain(ctx, jsonlPath, renameOnImport, dryRun, true); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					FatalError("%v", err)
 				}
 				return
 			}
@@ -190,11 +193,11 @@ Use --merge to merge the sync branch back to main branch.`,
 		if dryRun {
 			fmt.Println("→ [DRY RUN] Would export pending changes to JSONL")
 		} else {
-			// ZFC safety check (bd-l0r, bd-53c): if DB significantly diverges from JSONL,
+			// ZFC safety check: if DB significantly diverges from JSONL,
 			// force import first to sync with JSONL source of truth.
 			// After import, skip export to prevent overwriting JSONL (JSONL is source of truth).
 			//
-			// bd-53c fix: Added REVERSE ZFC check - if JSONL has MORE issues than DB,
+			// Added REVERSE ZFC check - if JSONL has MORE issues than DB,
 			// this indicates the DB is stale and exporting would cause data loss.
 			// This catches the case where a fresh/stale clone tries to export an
 			// empty or outdated database over a JSONL with many issues.
@@ -211,8 +214,7 @@ Use --merge to merge the sync branch back to main branch.`,
 								fmt.Printf("→ DB has %d issues but JSONL has %d (stale JSONL detected)\n", dbCount, jsonlCount)
 								fmt.Println("→ Importing JSONL first (ZFC)...")
 								if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-									fmt.Fprintf(os.Stderr, "Error importing (ZFC): %v\n", err)
-									os.Exit(1)
+									FatalError("importing (ZFC): %v", err)
 								}
 								// Skip export after ZFC import - JSONL is source of truth
 								skipExport = true
@@ -220,7 +222,7 @@ Use --merge to merge the sync branch back to main branch.`,
 							}
 						}
 
-						// Case 2 (bd-53c): JSONL has significantly more issues than DB
+						// Case 2: JSONL has significantly more issues than DB
 						// This is the DANGEROUS case - exporting would lose issues!
 						// A stale/empty DB exporting over a populated JSONL causes data loss.
 						if jsonlCount > dbCount && !skipExport {
@@ -229,11 +231,10 @@ Use --merge to merge the sync branch back to main branch.`,
 							// - Any loss > 20% is suspicious
 							// - Complete loss (DB empty) is always blocked
 							if dbCount == 0 || divergence > 0.2 {
-								fmt.Printf("→ JSONL has %d issues but DB has only %d (stale DB detected - bd-53c)\n", jsonlCount, dbCount)
+								fmt.Printf("→ JSONL has %d issues but DB has only %d (stale DB detected)\n", jsonlCount, dbCount)
 								fmt.Println("→ Importing JSONL first to prevent data loss...")
 								if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-									fmt.Fprintf(os.Stderr, "Error importing (reverse ZFC): %v\n", err)
-									os.Exit(1)
+									FatalError("importing (reverse ZFC): %v", err)
 								}
 								// Skip export after import - JSONL is source of truth
 								skipExport = true
@@ -243,7 +244,7 @@ Use --merge to merge the sync branch back to main branch.`,
 					}
 				}
 
-				// Case 3 (bd-f2f): JSONL content differs from DB (hash mismatch)
+				// Case 3: JSONL content differs from DB (hash mismatch)
 				// This catches the case where counts match but STATUS/content differs.
 				// A stale DB exporting wrong status values over correct JSONL values
 				// causes corruption that the 3-way merge propagates.
@@ -258,11 +259,10 @@ Use --merge to merge the sync branch back to main branch.`,
 				if !skipExport {
 					repoKey := getRepoKeyForPath(jsonlPath)
 					if hasJSONLChanged(ctx, store, jsonlPath, repoKey) {
-						fmt.Println("→ JSONL content differs from last sync (bd-f2f)")
+						fmt.Println("→ JSONL content differs from last sync")
 						fmt.Println("→ Importing JSONL first to prevent stale DB from overwriting changes...")
 						if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-							fmt.Fprintf(os.Stderr, "Error importing (bd-f2f hash mismatch): %v\n", err)
-							os.Exit(1)
+							FatalError("importing (hash mismatch): %v", err)
 						}
 						// Don't skip export - we still want to export any remaining local dirty issues
 						// The import updated DB with JSONL content, and export will write merged state
@@ -275,12 +275,10 @@ Use --merge to merge the sync branch back to main branch.`,
 				// Pre-export integrity checks
 				if err := ensureStoreActive(); err == nil && store != nil {
 					if err := validatePreExport(ctx, store, jsonlPath); err != nil {
-						fmt.Fprintf(os.Stderr, "Pre-export validation failed: %v\n", err)
-						os.Exit(1)
+						FatalError("pre-export validation failed: %v", err)
 					}
 					if err := checkDuplicateIDs(ctx, store); err != nil {
-						fmt.Fprintf(os.Stderr, "Database corruption detected: %v\n", err)
-						os.Exit(1)
+						FatalError("database corruption detected: %v", err)
 					}
 					if orphaned, err := checkOrphanedDeps(ctx, store); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: orphaned dependency check failed: %v\n", err)
@@ -289,44 +287,225 @@ Use --merge to merge the sync branch back to main branch.`,
 					}
 				}
 
+				// Template validation before export (bd-t7jq)
+				if err := validateOpenIssuesForSync(ctx); err != nil {
+					FatalError("%v", err)
+				}
+
 				fmt.Println("→ Exporting pending changes to JSONL...")
 				if err := exportToJSONL(ctx, jsonlPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error exporting: %v\n", err)
-					os.Exit(1)
+					FatalError("exporting: %v", err)
 				}
 			}
 
 			// Capture left snapshot (pre-pull state) for 3-way merge
 			// This is mandatory for deletion tracking integrity
 			if err := captureLeftSnapshot(jsonlPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to capture snapshot (required for deletion tracking): %v\n", err)
-				os.Exit(1)
+				FatalError("failed to capture snapshot (required for deletion tracking): %v", err)
 			}
 		}
 
-		// Check if sync.branch is configured for worktree-based sync (bd-e3w)
+		// Check if BEADS_DIR points to an external repository (dand-oss fix)
+		// If so, use direct git operations instead of worktree-based sync
+		beadsDir := filepath.Dir(jsonlPath)
+		isExternal := isExternalBeadsDir(ctx, beadsDir)
+
+		// GH#812/bd-n663: When sync.branch is configured, skip external direct-commit mode.
+		// The redirect may point to another clone/worktree in the same repo, but cross
+		// directory boundaries that trigger isExternalBeadsDir=true. When sync.branch is
+		// configured, we should use the sync.branch workflow which properly handles copying
+		// JSONL files to the sync branch worktree, regardless of where the source .beads lives.
+		if isExternal && !hasSyncBranchConfig {
+			// External BEADS_DIR: commit/pull directly to the beads repo
+			fmt.Println("→ External BEADS_DIR detected, using direct commit...")
+
+			// Check for changes in the external beads repo
+			externalRepoRoot, err := getRepoRootFromPath(ctx, beadsDir)
+			if err != nil {
+				FatalError("%v", err)
+			}
+
+			// Check if there are changes to commit
+			relBeadsDir, _ := filepath.Rel(externalRepoRoot, beadsDir)
+			statusCmd := exec.CommandContext(ctx, "git", "-C", externalRepoRoot, "status", "--porcelain", relBeadsDir)
+			statusOutput, _ := statusCmd.Output()
+			externalHasChanges := len(strings.TrimSpace(string(statusOutput))) > 0
+
+			if externalHasChanges {
+				if dryRun {
+					fmt.Printf("→ [DRY RUN] Would commit changes to external beads repo at %s\n", externalRepoRoot)
+				} else {
+					committed, err := commitToExternalBeadsRepo(ctx, beadsDir, message, !noPush)
+					if err != nil {
+						FatalError("%v", err)
+					}
+					if committed {
+						if !noPush {
+							fmt.Println("✓ Committed and pushed to external beads repo")
+						} else {
+							fmt.Println("✓ Committed to external beads repo")
+						}
+					}
+				}
+			} else {
+				fmt.Println("→ No changes to commit in external beads repo")
+			}
+
+			if !noPull {
+				if dryRun {
+					fmt.Printf("→ [DRY RUN] Would pull from external beads repo at %s\n", externalRepoRoot)
+				} else {
+					fmt.Println("→ Pulling from external beads repo...")
+					if err := pullFromExternalBeadsRepo(ctx, beadsDir); err != nil {
+						FatalError("pulling: %v", err)
+					}
+					fmt.Println("✓ Pulled from external beads repo")
+
+					// Re-import after pull to update local database
+					fmt.Println("→ Importing JSONL...")
+					if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+						FatalError("importing: %v", err)
+					}
+				}
+			}
+
+			// Clear sync state on successful sync (daemon backoff/hints)
+			_ = ClearSyncState(beadsDir)
+
+			fmt.Println("\n✓ Sync complete")
+			return
+		}
+
+		// Check if sync.branch is configured for worktree-based sync
 		// This allows committing to a separate branch without changing the user's working directory
 		var syncBranchName string
 		var repoRoot string
 		var useSyncBranch bool
+		var onSyncBranch bool // GH#519: track if we're on the sync branch
 		if err := ensureStoreActive(); err == nil && store != nil {
 			syncBranchName, _ = syncbranch.Get(ctx, store)
 			if syncBranchName != "" && syncbranch.HasGitRemote(ctx) {
-				repoRoot, err = syncbranch.GetRepoRoot(ctx)
+				// GH#829/bd-e2q9/bd-kvus: Get repo root from beads location, not cwd.
+				// When .beads/redirect exists, jsonlPath points to the redirected location
+				// (e.g., mayor/rig/.beads/issues.jsonl), but cwd is in a different repo
+				// (e.g., crew/gus). The worktree for sync-branch must be in the same
+				// repo as the beads directory.
+				beadsDir := filepath.Dir(jsonlPath)
+				repoRoot, err = getRepoRootFromPath(ctx, beadsDir)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: sync.branch configured but failed to get repo root: %v\n", err)
 					fmt.Fprintf(os.Stderr, "Falling back to current branch commits\n")
 				} else {
-					useSyncBranch = true
+					// GH#519: Check if current branch is the sync branch
+					// If so, commit directly instead of using worktree (which would fail)
+					currentBranch, _ := getCurrentBranch(ctx)
+					if currentBranch == syncBranchName {
+						onSyncBranch = true
+						// Don't use worktree - commit directly to current branch
+						useSyncBranch = false
+					} else {
+						useSyncBranch = true
+					}
 				}
 			}
 		}
 
+		// Force-push detection for sync branch (bd-hlsw.4)
+		// Check if the remote sync branch was force-pushed since last sync
+		if useSyncBranch && !noPull && !dryRun {
+			forcePushStatus, err := syncbranch.CheckForcePush(ctx, store, repoRoot, syncBranchName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not check for force-push: %v\n", err)
+			} else if forcePushStatus.Detected {
+				fmt.Fprintf(os.Stderr, "\n⚠️  %s\n\n", forcePushStatus.Message)
+
+				if acceptRebase {
+					// User explicitly accepted the rebase via --accept-rebase flag
+					fmt.Println("→ --accept-rebase specified, resetting to remote state...")
+					if err := syncbranch.ResetToRemote(ctx, repoRoot, syncBranchName, jsonlPath); err != nil {
+						FatalError("failed to reset to remote: %v", err)
+					}
+					// Clear the stored SHA since we're resetting
+					if err := syncbranch.ClearStoredRemoteSHA(ctx, store); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to clear stored remote SHA: %v\n", err)
+					}
+					fmt.Println("✓ Reset to remote sync branch state")
+					fmt.Println("→ Re-importing JSONL after reset...")
+					if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+						FatalError("importing after reset: %v", err)
+					}
+					fmt.Println("✓ Import complete after reset")
+
+					// Update stored SHA to current remote
+					if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to update stored remote SHA: %v\n", err)
+					}
+
+					fmt.Println("\n✓ Sync complete (reset to remote after force-push)")
+					return
+				}
+
+				// Prompt for confirmation
+				fmt.Fprintln(os.Stderr, "Options:")
+				fmt.Fprintln(os.Stderr, "  1. Reset to remote (discard local sync branch changes)")
+				fmt.Fprintln(os.Stderr, "  2. Abort sync (investigate manually)")
+				fmt.Fprintln(os.Stderr, "")
+				fmt.Fprintln(os.Stderr, "To reset automatically, run: bd sync --accept-rebase")
+				fmt.Fprintln(os.Stderr, "")
+				fmt.Fprint(os.Stderr, "Reset to remote state? [y/N]: ")
+
+				var response string
+				reader := bufio.NewReader(os.Stdin)
+				response, _ = reader.ReadString('\n')
+				response = strings.TrimSpace(strings.ToLower(response))
+
+				if response == "y" || response == "yes" {
+					fmt.Println("→ Resetting to remote state...")
+					if err := syncbranch.ResetToRemote(ctx, repoRoot, syncBranchName, jsonlPath); err != nil {
+						FatalError("failed to reset to remote: %v", err)
+					}
+					// Clear the stored SHA since we're resetting
+					if err := syncbranch.ClearStoredRemoteSHA(ctx, store); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to clear stored remote SHA: %v\n", err)
+					}
+					fmt.Println("✓ Reset to remote sync branch state")
+					fmt.Println("→ Re-importing JSONL after reset...")
+					if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
+						FatalError("importing after reset: %v", err)
+					}
+					fmt.Println("✓ Import complete after reset")
+
+					// Update stored SHA to current remote
+					if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to update stored remote SHA: %v\n", err)
+					}
+
+					fmt.Println("\n✓ Sync complete (reset to remote after force-push)")
+					return
+				}
+
+				// User chose to abort
+				FatalErrorWithHint("sync aborted due to force-push detection",
+					"investigate the sync branch history, then run 'bd sync --accept-rebase' to reset to remote")
+			}
+		}
+
 		// Step 2: Check if there are changes to commit (check entire .beads/ directory)
-		hasChanges, err := gitHasBeadsChanges(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking git status: %v\n", err)
-			os.Exit(1)
+		// GH#812: When using sync-branch, skip this check - CommitToSyncBranch handles it internally.
+		// The main repo's .beads may be gitignored on code branches (valid per #797/#801).
+		// In that case, gitHasBeadsChanges returns false even when JSONL has changes,
+		// because git doesn't track the files. CommitToSyncBranch copies files to the
+		// worktree where they ARE tracked (different gitignore) and checks there.
+		var hasChanges bool
+		var err error
+		if !useSyncBranch {
+			hasChanges, err = gitHasBeadsChanges(ctx)
+			if err != nil {
+				FatalError("checking git status: %v", err)
+			}
+		} else {
+			// Let CommitToSyncBranch determine if there are actual changes in the worktree
+			hasChanges = true
 		}
 
 		// Track if we already pushed via worktree (to skip Step 5)
@@ -336,16 +515,18 @@ Use --merge to merge the sync branch back to main branch.`,
 			if dryRun {
 				if useSyncBranch {
 					fmt.Printf("→ [DRY RUN] Would commit changes to sync branch '%s' via worktree\n", syncBranchName)
+				} else if onSyncBranch {
+					// GH#519: on sync branch, commit directly
+					fmt.Printf("→ [DRY RUN] Would commit changes directly to sync branch '%s'\n", syncBranchName)
 				} else {
 					fmt.Println("→ [DRY RUN] Would commit changes to git")
 				}
 			} else if useSyncBranch {
-				// Use worktree to commit to sync branch (bd-e3w)
+				// Use worktree to commit to sync branch
 				fmt.Printf("→ Committing changes to sync branch '%s'...\n", syncBranchName)
 				result, err := syncbranch.CommitToSyncBranch(ctx, repoRoot, syncBranchName, jsonlPath, !noPush)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error committing to sync branch: %v\n", err)
-					os.Exit(1)
+					FatalError("committing to sync branch: %v", err)
 				}
 				if result.Committed {
 					fmt.Printf("✓ Committed to %s\n", syncBranchName)
@@ -353,13 +534,21 @@ Use --merge to merge the sync branch back to main branch.`,
 						fmt.Printf("✓ Pushed %s to remote\n", syncBranchName)
 						pushedViaSyncBranch = true
 					}
+				} else {
+					// GH#812: When useSyncBranch is true, we always attempt commit
+					// (bypassing gitHasBeadsChanges). Report when worktree has no changes.
+					fmt.Println("→ No changes to commit")
 				}
 			} else {
 				// Regular commit to current branch
-				fmt.Println("→ Committing changes to git...")
+				// GH#519: if on sync branch, show appropriate message
+				if onSyncBranch {
+					fmt.Printf("→ Committing changes directly to sync branch '%s'...\n", syncBranchName)
+				} else {
+					fmt.Println("→ Committing changes to git...")
+				}
 				if err := gitCommitBeadsDir(ctx, message); err != nil {
-					fmt.Fprintf(os.Stderr, "Error committing: %v\n", err)
-					os.Exit(1)
+					FatalError("committing: %v", err)
 				}
 			}
 		} else {
@@ -372,36 +561,38 @@ Use --merge to merge the sync branch back to main branch.`,
 			if dryRun {
 				if useSyncBranch {
 					fmt.Printf("→ [DRY RUN] Would pull from sync branch '%s' via worktree\n", syncBranchName)
+				} else if onSyncBranch {
+					// GH#519: on sync branch, regular git pull
+					fmt.Printf("→ [DRY RUN] Would pull directly on sync branch '%s'\n", syncBranchName)
 				} else {
 					fmt.Println("→ [DRY RUN] Would pull from remote")
 				}
 			} else {
 				// Execute pull - either via sync branch worktree or regular git pull
 				if useSyncBranch {
-					// Pull from sync branch via worktree (bd-e3w)
+					// Pull from sync branch via worktree
 					fmt.Printf("→ Pulling from sync branch '%s'...\n", syncBranchName)
 
-					// bd-4u8: Check if confirmation is required for mass deletion
+					// Check if confirmation is required for mass deletion
 					requireMassDeleteConfirmation := config.GetBool("sync.require_confirmation_on_mass_delete")
 
 					pullResult, err := syncbranch.PullFromSyncBranch(ctx, repoRoot, syncBranchName, jsonlPath, !noPush, requireMassDeleteConfirmation)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error pulling from sync branch: %v\n", err)
-						os.Exit(1)
+						FatalError("pulling from sync branch: %v", err)
 					}
 					if pullResult.Pulled {
 						if pullResult.Merged {
-							// bd-3s8 fix: divergent histories were merged at content level
+							// Divergent histories were merged at content level
 							fmt.Printf("✓ Merged divergent histories from %s\n", syncBranchName)
 
-							// bd-7z4: Print safety warnings from result
+							// Print safety warnings from result
 							for _, warning := range pullResult.SafetyWarnings {
 								fmt.Fprintln(os.Stderr, warning)
 							}
 
-							// bd-4u8: Handle safety check with confirmation requirement
+							// Handle safety check with confirmation requirement
 							if pullResult.SafetyCheckTriggered && !pullResult.Pushed {
-								// bd-dmd: Don't duplicate SafetyCheckDetails - it's already in SafetyWarnings
+								// Don't duplicate SafetyCheckDetails - it's already in SafetyWarnings
 								// Prompt for confirmation
 								fmt.Fprintf(os.Stderr, "Push these changes to remote? [y/N]: ")
 
@@ -413,8 +604,7 @@ Use --merge to merge the sync branch back to main branch.`,
 								if response == "y" || response == "yes" {
 									fmt.Printf("→ Pushing to %s...\n", syncBranchName)
 									if err := syncbranch.PushSyncBranch(ctx, repoRoot, syncBranchName); err != nil {
-										fmt.Fprintf(os.Stderr, "Error pushing to sync branch: %v\n", err)
-										os.Exit(1)
+										FatalError("pushing to sync branch: %v", err)
 									}
 									fmt.Printf("✓ Pushed merged changes to %s\n", syncBranchName)
 									pushedViaSyncBranch = true
@@ -423,7 +613,7 @@ Use --merge to merge the sync branch back to main branch.`,
 									fmt.Println("If this was unintended, use 'git reflog' on the sync branch to recover.")
 								}
 							} else if pullResult.Pushed {
-								// bd-7ch: auto-push after merge
+								// Auto-push after merge
 								fmt.Printf("✓ Pushed merged changes to %s\n", syncBranchName)
 								pushedViaSyncBranch = true
 							}
@@ -438,7 +628,12 @@ Use --merge to merge the sync branch back to main branch.`,
 					// Check merge driver configuration before pulling
 					checkMergeDriverConfig()
 
-					fmt.Println("→ Pulling from remote...")
+					// GH#519: show appropriate message when on sync branch
+					if onSyncBranch {
+						fmt.Printf("→ Pulling from remote on sync branch '%s'...\n", syncBranchName)
+					} else {
+						fmt.Println("→ Pulling from remote...")
+					}
 					err := gitPull(ctx)
 					if err != nil {
 						// Check if it's a rebase conflict on beads.jsonl that we can auto-resolve
@@ -447,42 +642,33 @@ Use --merge to merge the sync branch back to main branch.`,
 
 							// Export clean JSONL from DB (database is source of truth)
 							if exportErr := exportToJSONL(ctx, jsonlPath); exportErr != nil {
-								fmt.Fprintf(os.Stderr, "Error: failed to export for conflict resolution: %v\n", exportErr)
-								fmt.Fprintf(os.Stderr, "Hint: resolve conflicts manually and run 'bd import' then 'bd sync' again\n")
-								os.Exit(1)
+								FatalErrorWithHint(fmt.Sprintf("failed to export for conflict resolution: %v", exportErr), "resolve conflicts manually and run 'bd import' then 'bd sync' again")
 							}
 
 							// Mark conflict as resolved
 							addCmd := exec.CommandContext(ctx, "git", "add", jsonlPath)
 							if addErr := addCmd.Run(); addErr != nil {
-								fmt.Fprintf(os.Stderr, "Error: failed to mark conflict resolved: %v\n", addErr)
-								fmt.Fprintf(os.Stderr, "Hint: resolve conflicts manually and run 'bd import' then 'bd sync' again\n")
-								os.Exit(1)
+								FatalErrorWithHint(fmt.Sprintf("failed to mark conflict resolved: %v", addErr), "resolve conflicts manually and run 'bd import' then 'bd sync' again")
 							}
 
 							// Continue rebase
 							if continueErr := runGitRebaseContinue(ctx); continueErr != nil {
-								fmt.Fprintf(os.Stderr, "Error: failed to continue rebase: %v\n", continueErr)
-								fmt.Fprintf(os.Stderr, "Hint: resolve conflicts manually and run 'bd import' then 'bd sync' again\n")
-								os.Exit(1)
+								FatalErrorWithHint(fmt.Sprintf("failed to continue rebase: %v", continueErr), "resolve conflicts manually and run 'bd import' then 'bd sync' again")
 							}
 
 							fmt.Println("✓ Auto-resolved JSONL conflict")
 						} else {
 							// Not an auto-resolvable conflict, fail with original error
-							fmt.Fprintf(os.Stderr, "Error pulling: %v\n", err)
-
 							// Check if this looks like a merge driver failure
 							errStr := err.Error()
 							if strings.Contains(errStr, "merge driver") ||
-							   strings.Contains(errStr, "no such file or directory") ||
-							   strings.Contains(errStr, "MERGE DRIVER INVOKED") {
+								strings.Contains(errStr, "no such file or directory") ||
+								strings.Contains(errStr, "MERGE DRIVER INVOKED") {
 								fmt.Fprintf(os.Stderr, "\nThis may be caused by an incorrect merge driver configuration.\n")
 								fmt.Fprintf(os.Stderr, "Fix: bd doctor --fix\n\n")
 							}
 
-							fmt.Fprintf(os.Stderr, "Hint: resolve conflicts manually and run 'bd import' then 'bd sync' again\n")
-							os.Exit(1)
+							FatalErrorWithHint(fmt.Sprintf("pulling: %v", err), "resolve conflicts manually and run 'bd import' then 'bd sync' again")
 						}
 					}
 				}
@@ -500,30 +686,16 @@ Use --merge to merge the sync branch back to main branch.`,
 				// Step 3.5: Perform 3-way merge and prune deletions
 				if err := ensureStoreActive(); err == nil && store != nil {
 					if err := applyDeletionsFromMerge(ctx, store, jsonlPath); err != nil {
-						fmt.Fprintf(os.Stderr, "Error during 3-way merge: %v\n", err)
-						os.Exit(1)
-					}
-				}
-
-				// Step 3.6: Sanitize JSONL - remove any resurrected zombies
-				// Git's 3-way merge may re-add deleted issues to JSONL.
-				// We must remove them before import to prevent resurrection.
-				sanitizeResult, err := sanitizeJSONLWithDeletions(jsonlPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to sanitize JSONL: %v\n", err)
-					// Non-fatal - continue with import
-				} else if sanitizeResult.RemovedCount > 0 {
-					fmt.Printf("→ Sanitized JSONL: removed %d deleted issue(s) that were resurrected by git merge\n", sanitizeResult.RemovedCount)
-					for _, id := range sanitizeResult.RemovedIDs {
-						fmt.Printf("  - %s\n", id)
+						FatalError("during 3-way merge: %v", err)
 					}
 				}
 
 				// Step 4: Import updated JSONL after pull
+				// Enable --protect-left-snapshot to prevent git-history-backfill from
+				// tombstoning issues that were in our local export but got lost during merge
 				fmt.Println("→ Importing updated JSONL...")
-				if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-					fmt.Fprintf(os.Stderr, "Error importing: %v\n", err)
-					os.Exit(1)
+				if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory, true); err != nil {
+					FatalError("importing: %v", err)
 				}
 
 				// Validate import didn't cause data loss
@@ -533,14 +705,8 @@ Use --merge to merge the sync branch back to main branch.`,
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "Warning: failed to count issues after import: %v\n", err)
 						} else {
-							// Account for expected deletions from sanitize step (bd-tt0 fix)
-							expectedDeletions := 0
-							if sanitizeResult != nil {
-								expectedDeletions = sanitizeResult.RemovedCount
-							}
-							if err := validatePostImportWithExpectedDeletions(beforeCount, afterCount, expectedDeletions, jsonlPath); err != nil {
-								fmt.Fprintf(os.Stderr, "Post-import validation failed: %v\n", err)
-								os.Exit(1)
+							if err := validatePostImportWithExpectedDeletions(beforeCount, afterCount, 0, jsonlPath); err != nil {
+								FatalError("post-import validation failed: %v", err)
 							}
 						}
 					}
@@ -581,32 +747,28 @@ Use --merge to merge the sync branch back to main branch.`,
 						if needsExport {
 							fmt.Println("→ Re-exporting after import to sync DB changes...")
 							if err := exportToJSONL(ctx, jsonlPath); err != nil {
-								fmt.Fprintf(os.Stderr, "Error re-exporting after import: %v\n", err)
-								os.Exit(1)
+								FatalError("re-exporting after import: %v", err)
 							}
 
 							// Step 4.6: Commit the re-export if it created changes
 							hasPostImportChanges, err := gitHasBeadsChanges(ctx)
 							if err != nil {
-								fmt.Fprintf(os.Stderr, "Error checking git status after re-export: %v\n", err)
-								os.Exit(1)
+								FatalError("checking git status after re-export: %v", err)
 							}
 							if hasPostImportChanges {
 								fmt.Println("→ Committing DB changes from import...")
 								if useSyncBranch {
-									// Commit to sync branch via worktree (bd-e3w)
+									// Commit to sync branch via worktree
 									result, err := syncbranch.CommitToSyncBranch(ctx, repoRoot, syncBranchName, jsonlPath, !noPush)
 									if err != nil {
-										fmt.Fprintf(os.Stderr, "Error committing to sync branch: %v\n", err)
-										os.Exit(1)
+										FatalError("committing to sync branch: %v", err)
 									}
 									if result.Pushed {
 										pushedViaSyncBranch = true
 									}
 								} else {
 									if err := gitCommitBeadsDir(ctx, "bd sync: apply DB changes after import"); err != nil {
-										fmt.Fprintf(os.Stderr, "Error committing post-import changes: %v\n", err)
-										os.Exit(1)
+										FatalError("committing post-import changes: %v", err)
 									}
 								}
 								hasChanges = true // Mark that we have changes to push
@@ -633,9 +795,7 @@ Use --merge to merge the sync branch back to main branch.`,
 			} else {
 				fmt.Println("→ Pushing to remote...")
 				if err := gitPush(ctx); err != nil {
-					fmt.Fprintf(os.Stderr, "Error pushing: %v\n", err)
-					fmt.Fprintf(os.Stderr, "Hint: pull may have brought new changes, run 'bd sync' again\n")
-					os.Exit(1)
+					FatalErrorWithHint(fmt.Sprintf("pushing: %v", err), "pull may have brought new changes, run 'bd sync' again")
 				}
 			}
 		}
@@ -643,17 +803,11 @@ Use --merge to merge the sync branch back to main branch.`,
 		if dryRun {
 			fmt.Println("\n✓ Dry run complete (no changes made)")
 		} else {
-			// Clean up temporary snapshot files after successful sync (bd-0io)
+			// Clean up temporary snapshot files after successful sync
 			// This runs regardless of whether pull was performed
 			sm := NewSnapshotManager(jsonlPath)
 			if err := sm.Cleanup(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to clean up snapshots: %v\n", err)
-			}
-
-			// Auto-compact deletions manifest if enabled and threshold exceeded
-			if err := maybeAutoCompactDeletions(ctx, jsonlPath); err != nil {
-				// Non-fatal - just log warning
-				fmt.Fprintf(os.Stderr, "Warning: auto-compact deletions failed: %v\n", err)
 			}
 
 			// When using sync.branch, restore .beads/ from current branch to keep
@@ -668,6 +822,19 @@ Use --merge to merge the sync branch back to main branch.`,
 				// Skip final flush in PersistentPostRun - we've already exported to sync branch
 				// and restored the working directory to match the current branch
 				skipFinalFlush = true
+			}
+
+			// Clear sync state on successful sync (daemon backoff/hints)
+			if bd := beads.FindBeadsDir(); bd != "" {
+				_ = ClearSyncState(bd)
+			}
+
+			// Update stored remote SHA after successful sync (bd-hlsw.4)
+			// This enables force-push detection on subsequent syncs
+			if useSyncBranch && !noPush {
+				if err := syncbranch.UpdateStoredRemoteSHA(ctx, store, repoRoot, syncBranchName); err != nil {
+					debug.Logf("sync: failed to update stored remote SHA: %v", err)
+				}
 			}
 
 			fmt.Println("\n✓ Sync complete")
@@ -689,1002 +856,16 @@ func init() {
 	syncCmd.Flags().Bool("from-main", false, "One-way sync from main branch (for ephemeral branches without upstream)")
 	syncCmd.Flags().Bool("no-git-history", false, "Skip git history backfill for deletions (use during JSONL filename migrations)")
 	syncCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output sync statistics in JSON format")
+	syncCmd.Flags().Bool("check", false, "Pre-sync integrity check: detect forced pushes, prefix mismatches, and orphaned issues")
+	syncCmd.Flags().Bool("accept-rebase", false, "Accept remote sync branch history (use when force-push detected)")
 	rootCmd.AddCommand(syncCmd)
 }
 
-// isGitRepo checks if the current directory is in a git repository
-func isGitRepo() bool {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	return cmd.Run() == nil
-}
-
-// gitHasUnmergedPaths checks for unmerged paths or merge in progress
-func gitHasUnmergedPaths() (bool, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
-	out, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-
-	// Check for unmerged status codes (DD, AU, UD, UA, DU, AA, UU)
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) >= 2 {
-			s := line[:2]
-			if s == "DD" || s == "AU" || s == "UD" || s == "UA" || s == "DU" || s == "AA" || s == "UU" {
-				return true, nil
-			}
-		}
-	}
-
-	// Check if MERGE_HEAD exists (merge in progress)
-	if exec.Command("git", "rev-parse", "-q", "--verify", "MERGE_HEAD").Run() == nil {
-		return true, nil
-	}
-
-	return false, nil
-}
-
-// gitHasUpstream checks if the current branch has an upstream configured
-// Uses git config directly for compatibility with Git for Windows
-func gitHasUpstream() bool {
-	// Get current branch name
-	branchCmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
-	branchOutput, err := branchCmd.Output()
-	if err != nil {
-		return false
-	}
-	branch := strings.TrimSpace(string(branchOutput))
-	
-	// Check if remote and merge refs are configured
-	remoteCmd := exec.Command("git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch))
-	mergeCmd := exec.Command("git", "config", "--get", fmt.Sprintf("branch.%s.merge", branch))
-	
-	remoteErr := remoteCmd.Run()
-	mergeErr := mergeCmd.Run()
-	
-	return remoteErr == nil && mergeErr == nil
-}
-
-// gitHasChanges checks if the specified file has uncommitted changes
-func gitHasChanges(ctx context.Context, filePath string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", filePath)
-	output, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-	return len(strings.TrimSpace(string(output))) > 0, nil
-}
-
-// gitHasBeadsChanges checks if any tracked files in .beads/ have uncommitted changes
-func gitHasBeadsChanges(ctx context.Context) (bool, error) {
-	beadsDir := findBeadsDir()
-	if beadsDir == "" {
-		return false, fmt.Errorf("no .beads directory found")
-	}
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", beadsDir)
-	output, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-	return len(strings.TrimSpace(string(output))) > 0, nil
-}
-
-// gitCommit commits the specified file
-func gitCommit(ctx context.Context, filePath string, message string) error {
-	// Stage the file
-	addCmd := exec.CommandContext(ctx, "git", "add", filePath)
-	if err := addCmd.Run(); err != nil {
-		return fmt.Errorf("git add failed: %w", err)
-	}
-
-	// Generate message if not provided
-	if message == "" {
-		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	}
-
-	// Commit
-	commitCmd := exec.CommandContext(ctx, "git", "commit", "-m", message)
-	output, err := commitCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git commit failed: %w\n%s", err, output)
-	}
-
-	return nil
-}
-
-// gitCommitBeadsDir stages and commits only sync-related files in .beads/ (bd-red fix)
-// This ensures bd sync doesn't accidentally commit other staged files.
-// Only stages specific sync files (issues.jsonl, deletions.jsonl, metadata.json)
-// to avoid staging gitignored snapshot files that may be tracked. (bd-guc fix)
-func gitCommitBeadsDir(ctx context.Context, message string) error {
-	beadsDir := findBeadsDir()
-	if beadsDir == "" {
-		return fmt.Errorf("no .beads directory found")
-	}
-
-	// Stage only the specific sync-related files (bd-guc)
-	// This avoids staging gitignored snapshot files (beads.*.jsonl, *.meta.json)
-	// that may still be tracked from before they were added to .gitignore
-	syncFiles := []string{
-		filepath.Join(beadsDir, "issues.jsonl"),
-		filepath.Join(beadsDir, "deletions.jsonl"),
-		filepath.Join(beadsDir, "metadata.json"),
-	}
-
-	// Only add files that exist
-	var filesToAdd []string
-	for _, f := range syncFiles {
-		if _, err := os.Stat(f); err == nil {
-			filesToAdd = append(filesToAdd, f)
-		}
-	}
-
-	if len(filesToAdd) == 0 {
-		return fmt.Errorf("no sync files found to commit")
-	}
-
-	// Stage only the sync files
-	args := append([]string{"add"}, filesToAdd...)
-	addCmd := exec.CommandContext(ctx, "git", args...)
-	if err := addCmd.Run(); err != nil {
-		return fmt.Errorf("git add failed: %w", err)
-	}
-
-	// Generate message if not provided
-	if message == "" {
-		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	}
-
-	// Commit only .beads/ files using -- pathspec (bd-red)
-	// This prevents accidentally committing other staged files that the user
-	// may have staged but wasn't ready to commit yet.
-	commitCmd := exec.CommandContext(ctx, "git", "commit", "-m", message, "--", beadsDir)
-	output, err := commitCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git commit failed: %w\n%s", err, output)
-	}
-
-	return nil
-}
-
-// hasGitRemote checks if a git remote exists in the repository
-func hasGitRemote(ctx context.Context) bool {
-	cmd := exec.CommandContext(ctx, "git", "remote")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return len(strings.TrimSpace(string(output))) > 0
-}
-
-// isInRebase checks if we're currently in a git rebase state
-func isInRebase() bool {
-	// Check for rebase-merge directory (interactive rebase)
-	if _, err := os.Stat(".git/rebase-merge"); err == nil {
-		return true
-	}
-	// Check for rebase-apply directory (non-interactive rebase)
-	if _, err := os.Stat(".git/rebase-apply"); err == nil {
-		return true
-	}
-	return false
-}
-
-// hasJSONLConflict checks if the beads JSONL file has a merge conflict
-// Returns true only if the JSONL file (issues.jsonl or beads.jsonl) is the only file in conflict
-func hasJSONLConflict() bool {
-	cmd := exec.Command("git", "status", "--porcelain")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	var hasJSONLConflict bool
-	var hasOtherConflict bool
-
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) < 3 {
-			continue
-		}
-
-		// Check for unmerged status codes (UU = both modified, AA = both added, etc.)
-		status := line[:2]
-		if status == "UU" || status == "AA" || status == "DD" ||
-			status == "AU" || status == "UA" || status == "DU" || status == "UD" {
-			filepath := strings.TrimSpace(line[3:])
-
-			// Check for beads JSONL files (issues.jsonl or beads.jsonl in .beads/)
-			if strings.HasSuffix(filepath, "issues.jsonl") || strings.HasSuffix(filepath, "beads.jsonl") {
-				hasJSONLConflict = true
-			} else {
-				hasOtherConflict = true
-			}
-		}
-	}
-
-	// Only return true if ONLY the JSONL file has a conflict
-	return hasJSONLConflict && !hasOtherConflict
-}
-
-// runGitRebaseContinue continues a rebase after resolving conflicts
-func runGitRebaseContinue(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "git", "rebase", "--continue")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git rebase --continue failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPull pulls from the current branch's upstream
-// Returns nil if no remote configured (local-only mode)
-func checkMergeDriverConfig() {
-	// Get current merge driver configuration
-	cmd := exec.Command("git", "config", "merge.beads.driver")
-	output, err := cmd.Output()
-	if err != nil {
-		// No merge driver configured - this is OK, user may not need it
-		return
-	}
-
-	currentConfig := strings.TrimSpace(string(output))
-
-	// Check if using old incorrect placeholders
-	if strings.Contains(currentConfig, "%L") || strings.Contains(currentConfig, "%R") {
-		fmt.Fprintf(os.Stderr, "\n⚠️  WARNING: Git merge driver is misconfigured!\n")
-		fmt.Fprintf(os.Stderr, "   Current: %s\n", currentConfig)
-		fmt.Fprintf(os.Stderr, "   Problem: Git only supports %%O (base), %%A (current), %%B (other)\n")
-		fmt.Fprintf(os.Stderr, "            Using %%L/%%R will cause merge failures!\n")
-		fmt.Fprintf(os.Stderr, "\n   Fix now: bd doctor --fix\n")
-		fmt.Fprintf(os.Stderr, "   Or manually: git config merge.beads.driver \"bd merge %%A %%O %%A %%B\"\n\n")
-	}
-}
-
-func gitPull(ctx context.Context) error {
-	// Check if any remote exists (bd-biwp: support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-	
-	// Get current branch name
-	// Use symbolic-ref to work in fresh repos without commits (bd-flil)
-	branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
-	branchOutput, err := branchCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to get current branch: %w", err)
-	}
-	branch := strings.TrimSpace(string(branchOutput))
-	
-	// Get remote name for current branch (usually "origin")
-	remoteCmd := exec.CommandContext(ctx, "git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch))
-	remoteOutput, err := remoteCmd.Output()
-	if err != nil {
-		// If no remote configured, default to "origin"
-		remoteOutput = []byte("origin\n")
-	}
-	remote := strings.TrimSpace(string(remoteOutput))
-	
-	// Pull with explicit remote and branch
-	cmd := exec.CommandContext(ctx, "git", "pull", remote, branch)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git pull failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPush pushes to the current branch's upstream
-// Returns nil if no remote configured (local-only mode)
-func gitPush(ctx context.Context) error {
-	// Check if any remote exists (bd-biwp: support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	cmd := exec.CommandContext(ctx, "git", "push")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git push failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// restoreBeadsDirFromBranch restores .beads/ directory from the current branch's committed state.
-// This is used after sync when sync.branch is configured to keep the working directory clean.
-// The actual beads data lives on the sync branch; the main branch's .beads/ is just a snapshot.
-func restoreBeadsDirFromBranch(ctx context.Context) error {
-	beadsDir := findBeadsDir()
-	if beadsDir == "" {
-		return fmt.Errorf("no .beads directory found")
-	}
-
-	// Restore .beads/ from HEAD (current branch's committed state)
-	// Using -- to ensure .beads/ is treated as a path, not a branch name
-	cmd := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", beadsDir)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git checkout failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// getDefaultBranch returns the default branch name (main or master) for origin remote
-// Checks remote HEAD first, then falls back to checking if main/master exist
-func getDefaultBranch(ctx context.Context) string {
-	return getDefaultBranchForRemote(ctx, "origin")
-}
-
-// getDefaultBranchForRemote returns the default branch name for a specific remote
-// Checks remote HEAD first, then falls back to checking if main/master exist
-func getDefaultBranchForRemote(ctx context.Context, remote string) string {
-	// Try to get default branch from remote
-	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", fmt.Sprintf("refs/remotes/%s/HEAD", remote))
-	output, err := cmd.Output()
-	if err == nil {
-		ref := strings.TrimSpace(string(output))
-		// Extract branch name from refs/remotes/<remote>/main
-		prefix := fmt.Sprintf("refs/remotes/%s/", remote)
-		if strings.HasPrefix(ref, prefix) {
-			return strings.TrimPrefix(ref, prefix)
-		}
-	}
-
-	// Fallback: check if <remote>/main exists
-	if exec.CommandContext(ctx, "git", "rev-parse", "--verify", fmt.Sprintf("%s/main", remote)).Run() == nil {
-		return "main"
-	}
-
-	// Fallback: check if <remote>/master exists
-	if exec.CommandContext(ctx, "git", "rev-parse", "--verify", fmt.Sprintf("%s/master", remote)).Run() == nil {
-		return "master"
-	}
-
-	// Default to main
-	return "main"
-}
-
-// doSyncFromMain performs a one-way sync from the default branch (main/master)
-// Used for ephemeral branches without upstream tracking (gt-ick9)
-// This fetches beads from main and imports them, discarding local beads changes.
-// If sync.remote is configured (e.g., "upstream" for fork workflows), uses that remote
-// instead of "origin" (bd-bx9).
-func doSyncFromMain(ctx context.Context, jsonlPath string, renameOnImport bool, dryRun bool, noGitHistory bool) error {
-	// Determine which remote to use (default: origin, but can be configured via sync.remote)
-	remote := "origin"
-	if err := ensureStoreActive(); err == nil && store != nil {
-		if configuredRemote, err := store.GetConfig(ctx, "sync.remote"); err == nil && configuredRemote != "" {
-			remote = configuredRemote
-		}
-	}
-
-	if dryRun {
-		fmt.Println("→ [DRY RUN] Would sync beads from main branch")
-		fmt.Printf("  1. Fetch %s main\n", remote)
-		fmt.Printf("  2. Checkout .beads/ from %s/main\n", remote)
-		fmt.Println("  3. Import JSONL into database")
-		fmt.Println("\n✓ Dry run complete (no changes made)")
-		return nil
-	}
-
-	// Check if we're in a git repository
-	if !isGitRepo() {
-		return fmt.Errorf("not in a git repository")
-	}
-
-	// Check if remote exists
-	if !hasGitRemote(ctx) {
-		return fmt.Errorf("no git remote configured")
-	}
-
-	// Verify the configured remote exists
-	checkRemoteCmd := exec.CommandContext(ctx, "git", "remote", "get-url", remote)
-	if err := checkRemoteCmd.Run(); err != nil {
-		return fmt.Errorf("configured sync.remote '%s' does not exist (run 'git remote add %s <url>')", remote, remote)
-	}
-
-	defaultBranch := getDefaultBranchForRemote(ctx, remote)
-
-	// Step 1: Fetch from main
-	fmt.Printf("→ Fetching from %s/%s...\n", remote, defaultBranch)
-	fetchCmd := exec.CommandContext(ctx, "git", "fetch", remote, defaultBranch)
-	if output, err := fetchCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch %s %s failed: %w\n%s", remote, defaultBranch, err, output)
-	}
-
-	// Step 2: Checkout .beads/ directory from main
-	fmt.Printf("→ Checking out beads from %s/%s...\n", remote, defaultBranch)
-	checkoutCmd := exec.CommandContext(ctx, "git", "checkout", fmt.Sprintf("%s/%s", remote, defaultBranch), "--", ".beads/")
-	if output, err := checkoutCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git checkout .beads/ from %s/%s failed: %w\n%s", remote, defaultBranch, err, output)
-	}
-
-	// Step 3: Import JSONL
-	fmt.Println("→ Importing JSONL...")
-	if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {
-		return fmt.Errorf("import failed: %w", err)
-	}
-
-	fmt.Println("\n✓ Sync from main complete")
-	return nil
-}
-
-// exportToJSONL exports the database to JSONL format
-func exportToJSONL(ctx context.Context, jsonlPath string) error {
-	// If daemon is running, use RPC
-	if daemonClient != nil {
-		exportArgs := &rpc.ExportArgs{
-			JSONLPath: jsonlPath,
-		}
-		resp, err := daemonClient.Export(exportArgs)
-		if err != nil {
-			return fmt.Errorf("daemon export failed: %w", err)
-		}
-		if !resp.Success {
-			return fmt.Errorf("daemon export error: %s", resp.Error)
-		}
-		return nil
-	}
-
-	// Direct mode: access store directly
-	// Ensure store is initialized
-	if err := ensureStoreActive(); err != nil {
-		return fmt.Errorf("failed to initialize store: %w", err)
-	}
-
-	// Get all issues
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
-	if err != nil {
-		return fmt.Errorf("failed to get issues: %w", err)
-	}
-
-	// Safety check: prevent exporting empty database over non-empty JSONL
-	// Note: The main bd-53c protection is the reverse ZFC check earlier in sync.go
-	// which runs BEFORE export. Here we only block the most catastrophic case (empty DB)
-	// to allow legitimate deletions.
-	if len(issues) == 0 {
-		existingCount, countErr := countIssuesInJSONL(jsonlPath)
-		if countErr != nil {
-			// If we can't read the file, it might not exist yet, which is fine
-			if !os.IsNotExist(countErr) {
-				fmt.Fprintf(os.Stderr, "Warning: failed to read existing JSONL: %v\n", countErr)
-			}
-		} else if existingCount > 0 {
-			return fmt.Errorf("refusing to export empty database over non-empty JSONL file (database: 0 issues, JSONL: %d issues)", existingCount)
-		}
-	}
-
-	// Sort by ID for consistent output
-	sort.Slice(issues, func(i, j int) bool {
-		return issues[i].ID < issues[j].ID
-	})
-
-	// Populate dependencies for all issues (avoid N+1)
-	allDeps, err := store.GetAllDependencyRecords(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get dependencies: %w", err)
-	}
-	for _, issue := range issues {
-		issue.Dependencies = allDeps[issue.ID]
-	}
-
-	// Populate labels for all issues
-	for _, issue := range issues {
-		labels, err := store.GetLabels(ctx, issue.ID)
-		if err != nil {
-			return fmt.Errorf("failed to get labels for %s: %w", issue.ID, err)
-		}
-		issue.Labels = labels
-	}
-
-	// Populate comments for all issues
-	for _, issue := range issues {
-		comments, err := store.GetIssueComments(ctx, issue.ID)
-		if err != nil {
-			return fmt.Errorf("failed to get comments for %s: %w", issue.ID, err)
-		}
-		issue.Comments = comments
-	}
-
-	// Create temp file for atomic write
-	dir := filepath.Dir(jsonlPath)
-	base := filepath.Base(jsonlPath)
-	tempFile, err := os.CreateTemp(dir, base+".tmp.*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	defer func() {
-		_ = tempFile.Close()
-		_ = os.Remove(tempPath)
-	}()
-
-	// Write JSONL
-	encoder := json.NewEncoder(tempFile)
-	exportedIDs := make([]string, 0, len(issues))
-	for _, issue := range issues {
-		if err := encoder.Encode(issue); err != nil {
-			return fmt.Errorf("failed to encode issue %s: %w", issue.ID, err)
-		}
-		exportedIDs = append(exportedIDs, issue.ID)
-	}
-
-	// Close temp file before rename
-	_ = tempFile.Close()
-
-	// Atomic replace
-	if err := os.Rename(tempPath, jsonlPath); err != nil {
-		return fmt.Errorf("failed to replace JSONL file: %w", err)
-	}
-
-	// Set appropriate file permissions (0600: rw-------)
-	if err := os.Chmod(jsonlPath, 0600); err != nil {
-		// Non-fatal warning
-		fmt.Fprintf(os.Stderr, "Warning: failed to set file permissions: %v\n", err)
-	}
-
-	// Clear dirty flags for exported issues
-	if err := store.ClearDirtyIssuesByID(ctx, exportedIDs); err != nil {
-		// Non-fatal warning
-		fmt.Fprintf(os.Stderr, "Warning: failed to clear dirty flags: %v\n", err)
-	}
-
-	// Clear auto-flush state
-	clearAutoFlushState()
-
-	// Update jsonl_content_hash metadata to enable content-based staleness detection (bd-khnb fix)
-	// After export, database and JSONL are in sync, so update hash to prevent unnecessary auto-import
-	// Renamed from last_import_hash (bd-39o) - more accurate since updated on both import AND export
-	if currentHash, err := computeJSONLHash(jsonlPath); err == nil {
-		if err := store.SetMetadata(ctx, "jsonl_content_hash", currentHash); err != nil {
-			// Non-fatal warning: Metadata update failures are intentionally non-fatal to prevent blocking
-			// successful exports. System degrades gracefully to mtime-based staleness detection if metadata
-			// is unavailable. This ensures export operations always succeed even if metadata storage fails.
-			fmt.Fprintf(os.Stderr, "Warning: failed to update jsonl_content_hash: %v\n", err)
-		}
-		// Use RFC3339Nano for nanosecond precision to avoid race with file mtime (fixes #399)
-		exportTime := time.Now().Format(time.RFC3339Nano)
-		if err := store.SetMetadata(ctx, "last_import_time", exportTime); err != nil {
-			// Non-fatal warning (see above comment about graceful degradation)
-			fmt.Fprintf(os.Stderr, "Warning: failed to update last_import_time: %v\n", err)
-		}
-		// Note: mtime tracking removed in bd-v0y fix (git doesn't preserve mtime)
-	}
-
-	// Update database mtime to be >= JSONL mtime (fixes #278, #301, #321)
-	// This prevents validatePreExport from incorrectly blocking on next export
-	beadsDir := filepath.Dir(jsonlPath)
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
-		// Non-fatal warning
-		fmt.Fprintf(os.Stderr, "Warning: failed to update database mtime: %v\n", err)
-	}
-
-	return nil
-}
-
-// getCurrentBranch returns the name of the current git branch
-// Uses symbolic-ref instead of rev-parse to work in fresh repos without commits (bd-flil)
-func getCurrentBranch(ctx context.Context) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current branch: %w", err)
-	}
-	return strings.TrimSpace(string(output)), nil
-}
-
-// getSyncBranch returns the configured sync branch name
-func getSyncBranch(ctx context.Context) (string, error) {
-	// Ensure store is initialized
-	if err := ensureStoreActive(); err != nil {
-		return "", fmt.Errorf("failed to initialize store: %w", err)
-	}
-
-	syncBranch, err := syncbranch.Get(ctx, store)
-	if err != nil {
-		return "", fmt.Errorf("failed to get sync branch config: %w", err)
-	}
-
-	if syncBranch == "" {
-		return "", fmt.Errorf("sync.branch not configured (run 'bd config set sync.branch <branch-name>')")
-	}
-
-	return syncBranch, nil
-}
-
-// showSyncStatus shows the diff between sync branch and main branch
-func showSyncStatus(ctx context.Context) error {
-	if !isGitRepo() {
-		return fmt.Errorf("not in a git repository")
-	}
-
-	currentBranch, err := getCurrentBranch(ctx)
-	if err != nil {
-		return err
-	}
-
-	syncBranch, err := getSyncBranch(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Check if sync branch exists
-	checkCmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+syncBranch)
-	if err := checkCmd.Run(); err != nil {
-		return fmt.Errorf("sync branch '%s' does not exist", syncBranch)
-	}
-
-	fmt.Printf("Current branch: %s\n", currentBranch)
-	fmt.Printf("Sync branch: %s\n\n", syncBranch)
-
-	// Show commit diff
-	fmt.Println("Commits in sync branch not in main:")
-	logCmd := exec.CommandContext(ctx, "git", "log", "--oneline", currentBranch+".."+syncBranch)
-	logOutput, err := logCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to get commit log: %w\n%s", err, logOutput)
-	}
-
-	if len(strings.TrimSpace(string(logOutput))) == 0 {
-		fmt.Println("  (none)")
-	} else {
-		fmt.Print(string(logOutput))
-	}
-
-	fmt.Println("\nCommits in main not in sync branch:")
-	logCmd = exec.CommandContext(ctx, "git", "log", "--oneline", syncBranch+".."+currentBranch)
-	logOutput, err = logCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to get commit log: %w\n%s", err, logOutput)
-	}
-
-	if len(strings.TrimSpace(string(logOutput))) == 0 {
-		fmt.Println("  (none)")
-	} else {
-		fmt.Print(string(logOutput))
-	}
-
-	// Show file diff for .beads/issues.jsonl
-	fmt.Println("\nFile differences in .beads/issues.jsonl:")
-	diffCmd := exec.CommandContext(ctx, "git", "diff", currentBranch+"..."+syncBranch, "--", ".beads/issues.jsonl")
-	diffOutput, err := diffCmd.CombinedOutput()
-	if err != nil {
-		// diff returns non-zero when there are differences, which is fine
-		if len(diffOutput) == 0 {
-			return fmt.Errorf("failed to get diff: %w", err)
-		}
-	}
-
-	if len(strings.TrimSpace(string(diffOutput))) == 0 {
-		fmt.Println("  (no differences)")
-	} else {
-		fmt.Print(string(diffOutput))
-	}
-
-	return nil
-}
-
-// mergeSyncBranch merges the sync branch back to main
-func mergeSyncBranch(ctx context.Context, dryRun bool) error {
-	if !isGitRepo() {
-		return fmt.Errorf("not in a git repository")
-	}
-
-	currentBranch, err := getCurrentBranch(ctx)
-	if err != nil {
-		return err
-	}
-
-	syncBranch, err := getSyncBranch(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Check if sync branch exists
-	checkCmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+syncBranch)
-	if err := checkCmd.Run(); err != nil {
-		return fmt.Errorf("sync branch '%s' does not exist", syncBranch)
-	}
-
-	// Verify we're on the main branch (not the sync branch)
-	if currentBranch == syncBranch {
-		return fmt.Errorf("cannot merge while on sync branch '%s' (checkout main branch first)", syncBranch)
-	}
-
-	// Check if main branch is clean
-	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
-	statusOutput, err := statusCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to check git status: %w", err)
-	}
-
-	if len(strings.TrimSpace(string(statusOutput))) > 0 {
-		return fmt.Errorf("main branch has uncommitted changes, please commit or stash them first")
-	}
-
-	if dryRun {
-		fmt.Printf("[DRY RUN] Would merge branch '%s' into '%s'\n", syncBranch, currentBranch)
-
-		// Show what would be merged
-		logCmd := exec.CommandContext(ctx, "git", "log", "--oneline", currentBranch+".."+syncBranch)
-		logOutput, err := logCmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to preview commits: %w", err)
-		}
-
-		if len(strings.TrimSpace(string(logOutput))) > 0 {
-			fmt.Println("\nCommits that would be merged:")
-			fmt.Print(string(logOutput))
-		} else {
-			fmt.Println("\nNo commits to merge (already up to date)")
-		}
-
-		return nil
-	}
-
-	// Perform the merge
-	fmt.Printf("Merging branch '%s' into '%s'...\n", syncBranch, currentBranch)
-
-	mergeCmd := exec.CommandContext(ctx, "git", "merge", "--no-ff", syncBranch, "-m",
-		fmt.Sprintf("Merge %s into %s", syncBranch, currentBranch))
-	mergeOutput, err := mergeCmd.CombinedOutput()
-	if err != nil {
-		// Check if it's a merge conflict
-		if strings.Contains(string(mergeOutput), "CONFLICT") || strings.Contains(string(mergeOutput), "conflict") {
-			fmt.Fprintf(os.Stderr, "Merge conflict detected:\n%s\n", mergeOutput)
-			fmt.Fprintf(os.Stderr, "\nTo resolve:\n")
-			fmt.Fprintf(os.Stderr, "1. Resolve conflicts in the affected files\n")
-			fmt.Fprintf(os.Stderr, "2. Stage resolved files: git add <files>\n")
-			fmt.Fprintf(os.Stderr, "3. Complete merge: git commit\n")
-			fmt.Fprintf(os.Stderr, "4. After merge commit, run 'bd import' to sync database\n")
-			return fmt.Errorf("merge conflict - see above for resolution steps")
-		}
-		return fmt.Errorf("merge failed: %w\n%s", err, mergeOutput)
-	}
-
-	fmt.Print(string(mergeOutput))
-	fmt.Println("\n✓ Merge complete")
-
-	// Suggest next steps
-	fmt.Println("\nNext steps:")
-	fmt.Println("1. Review the merged changes")
-	fmt.Println("2. Run 'bd sync --import-only' to sync the database with merged JSONL")
-	fmt.Println("3. Run 'bd sync' to push changes to remote")
-
-	return nil
-}
-
-// importFromJSONL imports the JSONL file by running the import command
-func importFromJSONL(ctx context.Context, jsonlPath string, renameOnImport bool, noGitHistory ...bool) error {
-	// Get current executable path to avoid "./bd" path issues
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot resolve current executable: %w", err)
-	}
-
-	// Build args for import command
-	// Use --no-daemon to ensure subprocess uses direct mode, avoiding daemon connection issues
-	args := []string{"--no-daemon", "import", "-i", jsonlPath}
-	if renameOnImport {
-		args = append(args, "--rename-on-import")
-	}
-	// Handle optional noGitHistory parameter
-	if len(noGitHistory) > 0 && noGitHistory[0] {
-		args = append(args, "--no-git-history")
-	}
-
-	// Run import command
-	cmd := exec.CommandContext(ctx, exe, args...) // #nosec G204 - bd import command from trusted binary
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("import failed: %w\n%s", err, output)
-	}
-
-	// Show output (import command provides the summary)
-	if len(output) > 0 {
-		fmt.Print(string(output))
-	}
-
-	return nil
-}
-
-// Default configuration values for auto-compact
-const (
-	defaultAutoCompact          = false
-	defaultAutoCompactThreshold = 1000
-)
-
-// maybeAutoCompactDeletions checks if auto-compact is enabled and threshold exceeded,
-// and if so, prunes the deletions manifest.
-func maybeAutoCompactDeletions(ctx context.Context, jsonlPath string) error {
-	// Ensure store is initialized for config access
-	if err := ensureStoreActive(); err != nil {
-		return nil // Can't access config, skip silently
-	}
-
-	// Check if auto-compact is enabled (disabled by default)
-	autoCompactStr, err := store.GetConfig(ctx, "deletions.auto_compact")
-	if err != nil || autoCompactStr == "" {
-		return nil // Not configured, skip
-	}
-
-	autoCompact := autoCompactStr == "true" || autoCompactStr == "1" || autoCompactStr == "yes"
-	if !autoCompact {
-		return nil // Disabled, skip
-	}
-
-	// Get threshold (default 1000)
-	threshold := defaultAutoCompactThreshold
-	if thresholdStr, err := store.GetConfig(ctx, "deletions.auto_compact_threshold"); err == nil && thresholdStr != "" {
-		if parsed, err := strconv.Atoi(thresholdStr); err == nil && parsed > 0 {
-			threshold = parsed
-		}
-	}
-
-	// Get deletions path
-	beadsDir := filepath.Dir(jsonlPath)
-	deletionsPath := deletions.DefaultPath(beadsDir)
-
-	// Count current deletions
-	count, err := deletions.Count(deletionsPath)
-	if err != nil {
-		return fmt.Errorf("failed to count deletions: %w", err)
-	}
-
-	// Check if threshold exceeded
-	if count <= threshold {
-		return nil // Below threshold, skip
-	}
-
-	// Get retention days (default 7)
-	retentionDays := configfile.DefaultDeletionsRetentionDays
-	if retentionStr, err := store.GetConfig(ctx, "deletions.retention_days"); err == nil && retentionStr != "" {
-		if parsed, err := strconv.Atoi(retentionStr); err == nil && parsed > 0 {
-			retentionDays = parsed
-		}
-	}
-
-	// Prune deletions
-	fmt.Printf("→ Auto-compacting deletions manifest (%d entries > %d threshold)...\n", count, threshold)
-	result, err := deletions.PruneDeletions(deletionsPath, retentionDays)
-	if err != nil {
-		return fmt.Errorf("failed to prune deletions: %w", err)
-	}
-
-	if result.PrunedCount > 0 {
-		fmt.Printf("  Pruned %d entries older than %d days, kept %d entries\n",
-			result.PrunedCount, retentionDays, result.KeptCount)
-	} else {
-		fmt.Printf("  No entries older than %d days to prune\n", retentionDays)
-	}
-
-	return nil
-}
-
-// SanitizeResult contains statistics about the JSONL sanitization operation.
-type SanitizeResult struct {
-	RemovedCount int      // Number of issues removed from JSONL
-	RemovedIDs   []string // IDs that were removed
-}
-
-// sanitizeJSONLWithDeletions removes any issues from the JSONL file that are
-// in the deletions manifest. This prevents zombie resurrection when git's
-// 3-way merge re-adds deleted issues to the JSONL during pull.
-//
-// This should be called after git pull but before import.
-func sanitizeJSONLWithDeletions(jsonlPath string) (*SanitizeResult, error) {
-	result := &SanitizeResult{
-		RemovedIDs: []string{},
-	}
-
-	// Get deletions manifest path
-	beadsDir := filepath.Dir(jsonlPath)
-	deletionsPath := deletions.DefaultPath(beadsDir)
-
-	// Load deletions manifest
-	loadResult, err := deletions.LoadDeletions(deletionsPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load deletions manifest: %w", err)
-	}
-
-	// If no deletions, nothing to sanitize
-	if len(loadResult.Records) == 0 {
-		return result, nil
-	}
-
-	// Read current JSONL
-	f, err := os.Open(jsonlPath) // #nosec G304 - controlled path
-	if err != nil {
-		if os.IsNotExist(err) {
-			return result, nil // No JSONL file yet
-		}
-		return nil, fmt.Errorf("failed to open JSONL: %w", err)
-	}
-
-	var keptLines [][]byte
-
-	scanner := bufio.NewScanner(f)
-	// Allow large lines (up to 10MB for issues with large descriptions)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-
-		// Quick extraction of ID without full unmarshal
-		// Look for "id":"..." pattern
-		var issue struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(line, &issue); err != nil {
-			// Keep malformed lines (let import handle them)
-			keptLines = append(keptLines, append([]byte{}, line...))
-			continue
-		}
-
-		// Check if this ID is in deletions manifest
-		if _, deleted := loadResult.Records[issue.ID]; deleted {
-			result.RemovedCount++
-			result.RemovedIDs = append(result.RemovedIDs, issue.ID)
-		} else {
-			keptLines = append(keptLines, append([]byte{}, line...))
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("failed to read JSONL: %w", err)
-	}
-	_ = f.Close()
-
-	// If nothing was removed, we're done
-	if result.RemovedCount == 0 {
-		return result, nil
-	}
-
-	// Write sanitized JSONL atomically
-	dir := filepath.Dir(jsonlPath)
-	base := filepath.Base(jsonlPath)
-	tempFile, err := os.CreateTemp(dir, base+".sanitize.*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	defer func() {
-		_ = tempFile.Close()
-		_ = os.Remove(tempPath) // Clean up on error
-	}()
-
-	for _, line := range keptLines {
-		if _, err := tempFile.Write(line); err != nil {
-			return nil, fmt.Errorf("failed to write line: %w", err)
-		}
-		if _, err := tempFile.Write([]byte("\n")); err != nil {
-			return nil, fmt.Errorf("failed to write newline: %w", err)
-		}
-	}
-
-	if err := tempFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Atomic replace
-	if err := os.Rename(tempPath, jsonlPath); err != nil {
-		return nil, fmt.Errorf("failed to replace JSONL: %w", err)
-	}
-
-	return result, nil
-}
-
-// resolveNoGitHistoryForFromMain returns the resolved noGitHistory value for sync operations.
-// When syncing from main (--from-main), noGitHistory is forced to true to prevent creating
-// incorrect deletion records for locally-created beads that don't exist on main.
-// See: https://github.com/steveyegge/beads/issues/417
-func resolveNoGitHistoryForFromMain(fromMain, noGitHistory bool) bool {
-	if fromMain {
-		return true
-	}
-	return noGitHistory
-}
+// Git helper functions moved to sync_git.go
+
+// doSyncFromMain function moved to sync_import.go
+// Export function moved to sync_export.go
+// Sync branch functions moved to sync_branch.go
+// Import functions moved to sync_import.go
+// External beads dir functions moved to sync_branch.go
+// Integrity check types and functions moved to sync_check.go

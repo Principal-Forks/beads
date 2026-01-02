@@ -7,40 +7,119 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/deletions"
+	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 )
+
+// deleteViaDaemon uses the RPC daemon to delete issues
+func deleteViaDaemon(issueIDs []string, force, dryRun, cascade bool, jsonOutput bool, reason string) {
+	// NOTE: The daemon's delete handler implements the core deletion logic.
+	// cascade and detailed dependency handling are not yet implemented in the RPC layer.
+	// For now, we pass force=true to the daemon and rely on its simpler deletion logic.
+	
+	deleteArgs := &rpc.DeleteArgs{
+		IDs:     issueIDs,
+		Force:   force,
+		DryRun:  dryRun,
+		Cascade: cascade,
+		Reason:  reason,
+	}
+	
+	resp, err := daemonClient.Delete(deleteArgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	if !resp.Success {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
+		os.Exit(1)
+	}
+	
+	// Parse response
+	var result map[string]interface{}
+	if err := json.Unmarshal(resp.Data, &result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+		os.Exit(1)
+	}
+	
+	if jsonOutput {
+		outputJSON(result)
+		return
+	}
+	
+	// Pretty print for human output
+	if dryRun {
+		fmt.Printf("Dry run - would delete %v issue(s)\n", result["issue_count"])
+		return
+	}
+	
+	deletedCount := int(result["deleted_count"].(float64))
+	totalCount := int(result["total_count"].(float64))
+
+	if deletedCount > 0 {
+		if deletedCount == 1 {
+			fmt.Printf("%s Deleted %s\n", ui.RenderPass("✓"), issueIDs[0])
+		} else {
+			fmt.Printf("%s Deleted %d issue(s)\n", ui.RenderPass("✓"), deletedCount)
+		}
+	}
+
+	if errors, ok := result["errors"].([]interface{}); ok && len(errors) > 0 {
+		fmt.Printf("\n%s Warnings:\n", ui.RenderWarn("⚠"))
+		for _, e := range errors {
+			fmt.Printf("  %s\n", e)
+		}
+		if deletedCount < totalCount {
+			os.Exit(1)
+		}
+	}
+}
+
 var deleteCmd = &cobra.Command{
-	Use:   "delete <issue-id> [issue-id...]",
-	Short: "Delete one or more issues and clean up references",
+	Use:     "delete <issue-id> [issue-id...]",
+	GroupID: "issues",
+	Short:   "Delete one or more issues and clean up references",
 	Long: `Delete one or more issues and clean up all references to them.
 This command will:
 1. Remove all dependency links (any type, both directions) involving the issues
 2. Update text references to "[deleted:ID]" in directly connected issues
-3. Delete the issues from the database
+3. Delete the issues from the database (creates tombstones by default)
+
 This is a destructive operation that cannot be undone. Use with caution.
+
 BATCH DELETION:
 Delete multiple issues at once:
   bd delete bd-1 bd-2 bd-3 --force
+
 Delete from file (one ID per line):
   bd delete --from-file deletions.txt --force
+
 Preview before deleting:
   bd delete --from-file deletions.txt --dry-run
+
 DEPENDENCY HANDLING:
 Default: Fails if any issue has dependents not in deletion set
   bd delete bd-1 bd-2
+
 Cascade: Recursively delete all dependents
   bd delete bd-1 --cascade --force
+
 Force: Delete and orphan dependents
-  bd delete bd-1 --force`,
+  bd delete bd-1 --force
+
+PERMANENT DELETION:
+Use --hard to permanently delete (bypass tombstones):
+  bd delete bd-1 bd-2 --hard --force
+
+WARNING: --hard bypasses sync safety. Use only when you are certain
+the issues will not resurrect from remote branches.`,
 	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("delete")
@@ -48,6 +127,11 @@ Force: Delete and orphan dependents
 		force, _ := cmd.Flags().GetBool("force")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		cascade, _ := cmd.Flags().GetBool("cascade")
+		hardDelete, _ := cmd.Flags().GetBool("hard")
+		reason, _ := cmd.Flags().GetString("reason")
+		if reason == "" {
+			reason = "delete"
+		}
 		// Use global jsonOutput set by PersistentPreRun
 		// Collect issue IDs from args and/or file
 		issueIDs := make([]string, 0, len(args))
@@ -67,25 +151,30 @@ Force: Delete and orphan dependents
 		}
 		// Remove duplicates
 		issueIDs = uniqueStrings(issueIDs)
-		// Handle batch deletion
-		if len(issueIDs) > 1 {
-			deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, "batch delete")
+		
+		// Use daemon if available, otherwise use direct mode
+		if daemonClient != nil {
+			deleteViaDaemon(issueIDs, force, dryRun, cascade, jsonOutput, reason)
 			return
 		}
-		// Single issue deletion (legacy behavior)
-		issueID := issueIDs[0]
-		// Ensure we have a direct store when daemon lacks delete support
-		if daemonClient != nil {
-			if err := ensureDirectMode("daemon does not support delete command"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store == nil {
+		
+		// Direct mode - ensure store is available
+		if store == nil {
 			if err := ensureStoreActive(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 		}
+		
+		// Handle batch deletion in direct mode
+		// Also use batch path for cascade (which needs to expand dependents)
+		if len(issueIDs) > 1 || cascade {
+			deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, reason)
+			return
+		}
+		
+		// Single issue deletion (legacy behavior)
+		issueID := issueIDs[0]
 		ctx := rootCtx
 		// Get the issue to be deleted
 		issue, err := store.GetIssue(ctx, issueID)
@@ -130,9 +219,7 @@ Force: Delete and orphan dependents
 		replacementText := `$1[deleted:` + issueID + `]$3`
 		// Preview mode
 		if !force {
-			red := color.New(color.FgRed).SprintFunc()
-			yellow := color.New(color.FgYellow).SprintFunc()
-			fmt.Printf("\n%s\n", red("⚠️  DELETE PREVIEW"))
+			fmt.Printf("\n%s\n", ui.RenderFail("⚠️  DELETE PREVIEW"))
 			fmt.Printf("\nIssue to delete:\n")
 			fmt.Printf("  %s: %s\n", issueID, issue.Title)
 			totalDeps := len(depRecords) + len(dependents)
@@ -163,18 +250,12 @@ Force: Delete and orphan dependents
 					fmt.Printf("  (none have text references)\n")
 				}
 			}
-			fmt.Printf("\n%s\n", yellow("This operation cannot be undone!"))
-			fmt.Printf("To proceed, run: %s\n\n", yellow("bd delete "+issueID+" --force"))
+			fmt.Printf("\n%s\n", ui.RenderWarn("This operation cannot be undone!"))
+			fmt.Printf("To proceed, run: %s\n\n", ui.RenderWarn("bd delete "+issueID+" --force"))
 			return
 		}
 		// Actually delete
-		// 0. Record deletion in manifest FIRST (before any DB changes)
-		// This ensures deletion propagates via git sync even if DB operations fail
 		deleteActor := getActorWithGit()
-		if err := recordDeletion(issueID, deleteActor, "manual delete"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to record deletion: %v\n", err)
-			os.Exit(1)
-		}
 		// 1. Update text references in connected issues (all text fields)
 		updatedIssueCount := 0
 		for id, connIssue := range connectedIssues {
@@ -229,7 +310,7 @@ Force: Delete and orphan dependents
 		}
 		// 4. Create tombstone (instead of deleting from database)
 		// Phase 1 dual-write: still writes to deletions.jsonl (step 0), now also creates tombstone
-		if err := createTombstone(ctx, issueID, deleteActor, "manual delete"); err != nil {
+		if err := createTombstone(ctx, issueID, deleteActor, reason); err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating tombstone: %v\n", err)
 			os.Exit(1)
 		}
@@ -244,8 +325,7 @@ Force: Delete and orphan dependents
 				"references_updated":   updatedIssueCount,
 			})
 		} else {
-			green := color.New(color.FgGreen).SprintFunc()
-			fmt.Printf("%s Deleted %s\n", green("✓"), issueID)
+			fmt.Printf("%s Deleted %s\n", ui.RenderPass("✓"), issueID)
 			fmt.Printf("  Removed %d dependency link(s)\n", totalDepsRemoved)
 			fmt.Printf("  Updated text references in %d issue(s)\n", updatedIssueCount)
 		}
@@ -345,14 +425,9 @@ func removeIssueFromJSONL(issueID string) error {
 }
 // deleteBatch handles deletion of multiple issues
 //nolint:unparam // cmd parameter required for potential future use
-func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, reason string) {
-	// Ensure we have a direct store when daemon lacks delete support
-	if daemonClient != nil {
-		if err := ensureDirectMode("daemon does not support delete command"); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-	} else if store == nil {
+func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, hardDelete bool, reason string) {
+	// Ensure we have a direct store
+	if store == nil {
 		if err := ensureStoreActive(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -362,8 +437,9 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// Type assert to SQLite storage
 	d, ok := store.(*sqlite.SQLiteStorage)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: batch delete not supported by this storage backend\n")
-		os.Exit(1)
+		// Fallback for non-SQLite storage (e.g., MemoryStorage in --no-db mode)
+		deleteBatchFallback(issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, reason)
+		return
 	}
 	// Verify all issues exist
 	issues := make(map[string]*types.Issue)
@@ -402,14 +478,13 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 		if dryRun {
 			fmt.Printf("\n(Dry-run mode - no changes made)\n")
 		} else {
-			yellow := color.New(color.FgYellow).SprintFunc()
-			fmt.Printf("\n%s\n", yellow("This operation cannot be undone!"))
+			fmt.Printf("\n%s\n", ui.RenderWarn("This operation cannot be undone!"))
 			if cascade {
 				fmt.Printf("To proceed with cascade deletion, run: %s\n",
-					yellow("bd delete "+strings.Join(issueIDs, " ")+" --cascade --force"))
+					ui.RenderWarn("bd delete "+strings.Join(issueIDs, " ")+" --cascade --force"))
 			} else {
 				fmt.Printf("To proceed, run: %s\n",
-					yellow("bd delete "+strings.Join(issueIDs, " ")+" --force"))
+					ui.RenderWarn("bd delete "+strings.Join(issueIDs, " ")+" --force"))
 			}
 		}
 		return
@@ -440,22 +515,33 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 			}
 		}
 	}
-	// Record deletions in manifest FIRST (before any DB changes)
-	// This ensures deletion propagates via git sync even if DB operations fail
-	deleteActor := getActorWithGit()
-	if err := recordDeletions(issueIDs, deleteActor, reason); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to record deletions: %v\n", err)
-		os.Exit(1)
-	}
-	// Actually delete
+	// Actually delete (creates tombstones)
 	result, err := d.DeleteIssues(ctx, issueIDs, cascade, force, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Hard delete: immediately prune tombstones from JSONL
+	// Note: We keep tombstones in DB to prevent resurrection during sync.
+	// The tombstones will be exported and synced to remote, blocking resurrection.
+	// Use 'bd cleanup --hard' after syncing to fully purge old tombstones.
+	if hardDelete {
+		if !jsonOutput {
+			fmt.Println(ui.RenderWarn("⚠️  HARD DELETE MODE: Pruning tombstones from JSONL"))
+			fmt.Println("  Note: Tombstones kept in DB to prevent resurrection. Run 'bd sync' then 'bd cleanup --hard' to fully purge.")
+		}
+		// Prune tombstones from JSONL using negative TTL (immediate expiration)
+		if pruneResult, err := pruneExpiredTombstones(-1); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to prune tombstones from JSONL: %v\n", err)
+		} else if pruneResult != nil && pruneResult.PrunedCount > 0 && !jsonOutput {
+			fmt.Printf("  Pruned %d tombstone(s) from JSONL\n", pruneResult.PrunedCount)
+		}
+	}
+
 	// Update text references in connected issues (using pre-collected issues)
 	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
-	// Note: No longer remove from JSONL - tombstones will be exported to JSONL (bd-3b4)
+	// Note: No longer remove from JSONL - tombstones will be exported to JSONL
 	// Schedule auto-flush
 	markDirtyAndScheduleFlush()
 	// Output results
@@ -470,24 +556,158 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 			"orphaned_issues":      result.OrphanedIssues,
 		})
 	} else {
-		green := color.New(color.FgGreen).SprintFunc()
-		fmt.Printf("%s Deleted %d issue(s)\n", green("✓"), result.DeletedCount)
+		fmt.Printf("%s Deleted %d issue(s)\n", ui.RenderPass("✓"), result.DeletedCount)
 		fmt.Printf("  Removed %d dependency link(s)\n", result.DependenciesCount)
 		fmt.Printf("  Removed %d label(s)\n", result.LabelsCount)
 		fmt.Printf("  Removed %d event(s)\n", result.EventsCount)
 		fmt.Printf("  Updated text references in %d issue(s)\n", updatedCount)
 		if len(result.OrphanedIssues) > 0 {
-			yellow := color.New(color.FgYellow).SprintFunc()
 			fmt.Printf("  %s Orphaned %d issue(s): %s\n",
-				yellow("⚠"), len(result.OrphanedIssues), strings.Join(result.OrphanedIssues, ", "))
+				ui.RenderWarn("⚠"), len(result.OrphanedIssues), strings.Join(result.OrphanedIssues, ", "))
 		}
 	}
 }
+
+// deleteBatchFallback handles batch deletion for non-SQLite storage (e.g., MemoryStorage in --no-db mode)
+// It iterates through issues one by one, creating tombstones for each.
+func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, hardDelete bool, reason string) {
+	ctx := rootCtx
+
+	// Cascade not supported in fallback mode
+	if cascade {
+		fmt.Fprintf(os.Stderr, "Error: --cascade not supported in --no-db mode\n")
+		os.Exit(1)
+	}
+
+	// Verify all issues exist first
+	issues := make(map[string]*types.Issue)
+	notFound := []string{}
+	for _, id := range issueIDs {
+		issue, err := store.GetIssue(ctx, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting issue %s: %v\n", id, err)
+			os.Exit(1)
+		}
+		if issue == nil {
+			notFound = append(notFound, id)
+		} else {
+			issues[id] = issue
+		}
+	}
+	if len(notFound) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: issues not found: %s\n", strings.Join(notFound, ", "))
+		os.Exit(1)
+	}
+
+	// Preview mode
+	if dryRun || !force {
+		fmt.Printf("\n%s\n", ui.RenderFail("⚠️  DELETE PREVIEW"))
+		fmt.Printf("\nIssues to delete (%d):\n", len(issueIDs))
+		for _, id := range issueIDs {
+			if issue := issues[id]; issue != nil {
+				fmt.Printf("  %s: %s\n", id, issue.Title)
+			}
+		}
+		if dryRun {
+			fmt.Printf("\n(Dry-run mode - no changes made)\n")
+		} else {
+			fmt.Printf("\n%s\n", ui.RenderWarn("This operation cannot be undone!"))
+			fmt.Printf("To proceed, run: %s\n",
+				ui.RenderWarn("bd delete "+strings.Join(issueIDs, " ")+" --force"))
+		}
+		return
+	}
+
+	// Pre-collect connected issues before deletion (for text reference updates)
+	connectedIssues := make(map[string]*types.Issue)
+	idSet := make(map[string]bool)
+	for _, id := range issueIDs {
+		idSet[id] = true
+	}
+	for _, id := range issueIDs {
+		deps, err := store.GetDependencies(ctx, id)
+		if err == nil {
+			for _, dep := range deps {
+				if !idSet[dep.ID] {
+					connectedIssues[dep.ID] = dep
+				}
+			}
+		}
+		dependents, err := store.GetDependents(ctx, id)
+		if err == nil {
+			for _, dep := range dependents {
+				if !idSet[dep.ID] {
+					connectedIssues[dep.ID] = dep
+				}
+			}
+		}
+	}
+
+	// Delete each issue
+	deleteActor := getActorWithGit()
+	deletedCount := 0
+	depsRemoved := 0
+
+	for _, issueID := range issueIDs {
+		// Remove dependencies (outgoing)
+		depRecords, err := store.GetDependencyRecords(ctx, issueID)
+		if err == nil {
+			for _, dep := range depRecords {
+				if err := store.RemoveDependency(ctx, dep.IssueID, dep.DependsOnID, deleteActor); err == nil {
+					depsRemoved++
+				}
+			}
+		}
+
+		// Remove dependencies (inbound)
+		dependents, err := store.GetDependents(ctx, issueID)
+		if err == nil {
+			for _, dep := range dependents {
+				if err := store.RemoveDependency(ctx, dep.ID, issueID, deleteActor); err == nil {
+					depsRemoved++
+				}
+			}
+		}
+
+		// Create tombstone
+		if err := createTombstone(ctx, issueID, deleteActor, reason); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating tombstone for %s: %v\n", issueID, err)
+			continue
+		}
+		deletedCount++
+	}
+
+	// Update text references in connected issues
+	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
+
+	// Hard delete: remove from JSONL immediately
+	if hardDelete {
+		for _, id := range issueIDs {
+			_ = removeIssueFromJSONL(id)
+		}
+	}
+
+	// Schedule auto-flush
+	markDirtyAndScheduleFlush()
+
+	// Output results
+	if jsonOutput {
+		outputJSON(map[string]interface{}{
+			"deleted":              issueIDs,
+			"deleted_count":        deletedCount,
+			"dependencies_removed": depsRemoved,
+			"references_updated":   updatedCount,
+		})
+	} else {
+		fmt.Printf("%s Deleted %d issue(s)\n", ui.RenderPass("✓"), deletedCount)
+		fmt.Printf("  Removed %d dependency link(s)\n", depsRemoved)
+		fmt.Printf("  Updated text references in %d issue(s)\n", updatedCount)
+	}
+}
+
 // showDeletionPreview shows what would be deleted
 func showDeletionPreview(issueIDs []string, issues map[string]*types.Issue, cascade bool, depError error) {
-	red := color.New(color.FgRed).SprintFunc()
-	yellow := color.New(color.FgYellow).SprintFunc()
-	fmt.Printf("\n%s\n", red("⚠️  DELETE PREVIEW"))
+	fmt.Printf("\n%s\n", ui.RenderFail("⚠️  DELETE PREVIEW"))
 	fmt.Printf("\nIssues to delete (%d):\n", len(issueIDs))
 	for _, id := range issueIDs {
 		if issue := issues[id]; issue != nil {
@@ -495,10 +715,10 @@ func showDeletionPreview(issueIDs []string, issues map[string]*types.Issue, casc
 		}
 	}
 	if cascade {
-		fmt.Printf("\n%s Cascade mode enabled - will also delete all dependent issues\n", yellow("⚠"))
+		fmt.Printf("\n%s Cascade mode enabled - will also delete all dependent issues\n", ui.RenderWarn("⚠"))
 	}
 	if depError != nil {
-		fmt.Printf("\n%s\n", red(depError.Error()))
+		fmt.Printf("\n%s\n", ui.RenderFail(depError.Error()))
 	}
 }
 // updateTextReferencesInIssues updates text references to deleted issues in pre-collected connected issues
@@ -606,50 +826,12 @@ func getActorWithGit() string {
 	return "unknown"
 }
 
-// getDeletionsPath returns the path to the deletions manifest file.
-// Uses the same directory as the database.
-func getDeletionsPath() string {
-	// Get the .beads directory from dbPath
-	beadsDir := filepath.Dir(dbPath)
-	return deletions.DefaultPath(beadsDir)
-}
-
-// recordDeletion appends a deletion record to the deletions manifest.
-// This MUST be called BEFORE deleting from the database to ensure
-// deletion records are never lost.
-func recordDeletion(id, deleteActor, reason string) error {
-	record := deletions.DeletionRecord{
-		ID:        id,
-		Timestamp: time.Now().UTC(),
-		Actor:     deleteActor,
-		Reason:    reason,
-	}
-	return deletions.AppendDeletion(getDeletionsPath(), record)
-}
-
-// recordDeletions appends multiple deletion records to the deletions manifest.
-// This MUST be called BEFORE deleting from the database to ensure
-// deletion records are never lost.
-func recordDeletions(ids []string, deleteActor, reason string) error {
-	path := getDeletionsPath()
-	for _, id := range ids {
-		record := deletions.DeletionRecord{
-			ID:        id,
-			Timestamp: time.Now().UTC(),
-			Actor:     deleteActor,
-			Reason:    reason,
-		}
-		if err := deletions.AppendDeletion(path, record); err != nil {
-			return fmt.Errorf("failed to record deletion for %s: %w", id, err)
-		}
-	}
-	return nil
-}
-
 func init() {
 	deleteCmd.Flags().BoolP("force", "f", false, "Actually delete (without this flag, shows preview)")
 	deleteCmd.Flags().String("from-file", "", "Read issue IDs from file (one per line)")
 	deleteCmd.Flags().Bool("dry-run", false, "Preview what would be deleted without making changes")
 	deleteCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
+	deleteCmd.Flags().Bool("hard", false, "Permanently delete (skip tombstone, cannot be recovered via sync)")
+	deleteCmd.Flags().String("reason", "", "Reason for deletion (stored in tombstone for audit trail)")
 	rootCmd.AddCommand(deleteCmd)
 }

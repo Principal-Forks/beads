@@ -35,11 +35,20 @@ func (wm *WorktreeManager) CreateBeadsWorktree(branch, worktreePath string) erro
 	if _, err := os.Stat(worktreePath); err == nil {
 		// Worktree path exists, check if it's a valid worktree
 		if valid, err := wm.isValidWorktree(worktreePath); err == nil && valid {
-			return nil // Already exists and is valid
-		}
-		// Path exists but isn't a valid worktree, remove it
-		if err := os.RemoveAll(worktreePath); err != nil {
-			return fmt.Errorf("failed to remove invalid worktree path: %w", err)
+			// Worktree exists and is in git worktree list, verify full health
+			if err := wm.CheckWorktreeHealth(worktreePath); err == nil {
+				return nil // Already exists and is fully healthy
+			}
+			// Health check failed, try to repair by removing and recreating
+			if err := wm.RemoveBeadsWorktree(worktreePath); err != nil {
+				// Log but continue - we'll try to recreate anyway
+				_ = os.RemoveAll(worktreePath)
+			}
+		} else {
+			// Path exists but isn't a valid worktree, remove it
+			if err := os.RemoveAll(worktreePath); err != nil {
+				return fmt.Errorf("failed to remove invalid worktree path: %w", err)
+			}
 		}
 	}
 
@@ -52,13 +61,15 @@ func (wm *WorktreeManager) CreateBeadsWorktree(branch, worktreePath string) erro
 	branchExists := wm.branchExists(branch)
 
 	// Create worktree without checking out files initially
+	// Use -f (force) to handle "missing but already registered" state (issue #609)
+	// This occurs when the worktree directory was deleted but git registration persists
 	var cmd *exec.Cmd
 	if branchExists {
 		// Checkout existing branch
-		cmd = exec.Command("git", "worktree", "add", "--no-checkout", worktreePath, branch)
+		cmd = exec.Command("git", "worktree", "add", "-f", "--no-checkout", worktreePath, branch)
 	} else {
 		// Create new branch
-		cmd = exec.Command("git", "worktree", "add", "--no-checkout", "-b", branch, worktreePath)
+		cmd = exec.Command("git", "worktree", "add", "-f", "--no-checkout", "-b", branch, worktreePath)
 	}
 	cmd.Dir = wm.repoPath
 
@@ -143,16 +154,42 @@ func (wm *WorktreeManager) CheckWorktreeHealth(worktreePath string) error {
 	return nil
 }
 
+// SyncOptions configures the behavior of SyncJSONLToWorktree
+type SyncOptions struct {
+	// ForceOverwrite bypasses the merge logic and always overwrites the worktree
+	// JSONL with the local JSONL. This should be set to true when the daemon
+	// knows that a mutation (especially delete) occurred, so the local state
+	// is authoritative and should not be merged with potentially stale worktree data.
+	ForceOverwrite bool
+}
+
 // SyncJSONLToWorktree syncs the JSONL file from main repo to worktree.
 // If the worktree has issues that the local repo doesn't have, it merges them
 // instead of overwriting. This prevents data loss when a fresh clone syncs
 // with fewer issues than the remote. (bd-52q fix for GitHub #464)
+// Note: This is a convenience wrapper that calls SyncJSONLToWorktreeWithOptions
+// with default options (ForceOverwrite=false).
 func (wm *WorktreeManager) SyncJSONLToWorktree(worktreePath, jsonlRelPath string) error {
-	// Source: main repo JSONL
+	return wm.SyncJSONLToWorktreeWithOptions(worktreePath, jsonlRelPath, SyncOptions{})
+}
+
+// SyncJSONLToWorktreeWithOptions syncs the JSONL file from main repo to worktree
+// with configurable options.
+// If ForceOverwrite is true, the local JSONL is always copied to the worktree,
+// bypassing the merge logic. This is used when the daemon knows a mutation
+// (especially delete) occurred and the local state is authoritative.
+// If ForceOverwrite is false (default), the function uses merge logic to prevent
+// data loss when a fresh clone syncs with fewer issues than the remote.
+func (wm *WorktreeManager) SyncJSONLToWorktreeWithOptions(worktreePath, jsonlRelPath string, opts SyncOptions) error {
+	// Source: main repo JSONL (use the full path as provided)
 	srcPath := filepath.Join(wm.repoPath, jsonlRelPath)
 
 	// Destination: worktree JSONL
-	dstPath := filepath.Join(worktreePath, jsonlRelPath)
+	// GH#785, GH#810: Handle bare repo worktrees where jsonlRelPath might include the
+	// worktree name (e.g., "main/.beads/issues.jsonl"). The sync branch uses
+	// sparse checkout for .beads/* so we normalize to strip leading components.
+	normalizedRelPath := NormalizeBeadsRelPath(jsonlRelPath)
+	dstPath := filepath.Join(worktreePath, normalizedRelPath)
 
 	// Ensure destination directory exists
 	dstDir := filepath.Dir(dstPath)
@@ -170,6 +207,17 @@ func (wm *WorktreeManager) SyncJSONLToWorktree(worktreePath, jsonlRelPath string
 	dstData, dstErr := os.ReadFile(dstPath) // #nosec G304 - controlled path
 	if dstErr != nil || len(dstData) == 0 {
 		// Destination doesn't exist or is empty - just copy
+		if err := os.WriteFile(dstPath, srcData, 0644); err != nil { // #nosec G306 - JSONL needs to be readable
+			return fmt.Errorf("failed to write destination JSONL: %w", err)
+		}
+		return nil
+	}
+
+	// ForceOverwrite: When the daemon knows a mutation occurred (especially delete),
+	// the local state is authoritative and should overwrite the worktree without merging.
+	// This fixes the bug where `bd delete` mutations were not reflected in the sync branch
+	// because the merge logic would re-add the deleted issue.
+	if opts.ForceOverwrite {
 		if err := os.WriteFile(dstPath, srcData, 0644); err != nil { // #nosec G306 - JSONL needs to be readable
 			return fmt.Errorf("failed to write destination JSONL: %w", err)
 		}
@@ -272,7 +320,6 @@ func (wm *WorktreeManager) mergeJSONLFiles(srcData, dstData []byte) ([]byte, err
 	return mergedData, nil
 }
 
-
 // isValidWorktree checks if the path is a valid git worktree
 func (wm *WorktreeManager) isValidWorktree(worktreePath string) (bool, error) {
 	cmd := exec.Command("git", "worktree", "list", "--porcelain")
@@ -372,6 +419,21 @@ func (wm *WorktreeManager) configureSparseCheckout(worktreePath string) error {
 	}
 
 	return nil
+}
+
+// NormalizeBeadsRelPath strips any leading path components before .beads/.
+// This handles bare repo worktrees where the relative path includes the worktree
+// name (e.g., "main/.beads/issues.jsonl" -> ".beads/issues.jsonl").
+// GH#785, GH#810: Fix for sync failing across worktrees in bare repo setup.
+func NormalizeBeadsRelPath(relPath string) string {
+	// Use filepath.ToSlash for consistent handling across platforms
+	normalized := filepath.ToSlash(relPath)
+	// Look for ".beads/" to ensure we match the directory, not a prefix like ".beads-backup"
+	if idx := strings.Index(normalized, ".beads/"); idx > 0 {
+		// Strip leading path components before .beads
+		return filepath.FromSlash(normalized[idx:])
+	}
+	return relPath
 }
 
 // verifySparseCheckout checks if sparse checkout is configured correctly

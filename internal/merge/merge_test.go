@@ -128,22 +128,25 @@ func TestMergeField(t *testing.T) {
 	}
 }
 
-// TestMergeDependencies tests dependency union and deduplication
+// TestMergeDependencies tests 3-way dependency merge with removal semantics (bd-ndye)
 func TestMergeDependencies(t *testing.T) {
 	tests := []struct {
 		name     string
+		base     []Dependency
 		left     []Dependency
 		right    []Dependency
 		expected []Dependency
 	}{
 		{
-			name:     "empty both sides",
+			name:     "empty all sides",
+			base:     []Dependency{},
 			left:     []Dependency{},
 			right:    []Dependency{},
 			expected: []Dependency{},
 		},
 		{
-			name: "only left has deps",
+			name: "left adds dep (not in base)",
+			base: []Dependency{},
 			left: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
 			},
@@ -153,7 +156,8 @@ func TestMergeDependencies(t *testing.T) {
 			},
 		},
 		{
-			name: "only right has deps",
+			name: "right adds dep (not in base)",
+			base: []Dependency{},
 			left: []Dependency{},
 			right: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-3", Type: "related", CreatedAt: "2024-01-01T00:00:00Z"},
@@ -163,7 +167,8 @@ func TestMergeDependencies(t *testing.T) {
 			},
 		},
 		{
-			name: "union of different deps",
+			name: "both add different deps (not in base)",
+			base: []Dependency{},
 			left: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
 			},
@@ -176,38 +181,74 @@ func TestMergeDependencies(t *testing.T) {
 			},
 		},
 		{
-			name: "deduplication of identical deps",
+			name: "both add same dep (not in base) - no duplicates",
+			base: []Dependency{},
 			left: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
-			},
-			right: []Dependency{
-				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-02T00:00:00Z"}, // Different timestamp but same logical dep
-			},
-			expected: []Dependency{
-				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
-			},
-		},
-		{
-			name: "multiple deps with dedup",
-			left: []Dependency{
-				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
-				{IssueID: "bd-1", DependsOnID: "bd-3", Type: "related", CreatedAt: "2024-01-01T00:00:00Z"},
 			},
 			right: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-02T00:00:00Z"},
-				{IssueID: "bd-1", DependsOnID: "bd-4", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			expected: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"}, // Left preferred
+			},
+		},
+		{
+			name: "left removes dep from base - REMOVAL WINS",
+			base: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			left:     []Dependency{}, // Left removed it
+			right: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			expected: []Dependency{}, // Should be empty - removal wins
+		},
+		{
+			name: "right removes dep from base - REMOVAL WINS",
+			base: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			left: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			right:    []Dependency{}, // Right removed it
+			expected: []Dependency{}, // Should be empty - removal wins
+		},
+		{
+			name: "both keep dep from base",
+			base: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			left: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			right: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-02T00:00:00Z"},
 			},
 			expected: []Dependency{
 				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
-				{IssueID: "bd-1", DependsOnID: "bd-3", Type: "related", CreatedAt: "2024-01-01T00:00:00Z"},
-				{IssueID: "bd-1", DependsOnID: "bd-4", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+		},
+		{
+			name: "complex: left removes one, right adds one",
+			base: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+			},
+			left: []Dependency{}, // Left removed bd-2
+			right: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-2", Type: "blocks", CreatedAt: "2024-01-01T00:00:00Z"},
+				{IssueID: "bd-1", DependsOnID: "bd-3", Type: "related", CreatedAt: "2024-01-01T00:00:00Z"}, // Right added bd-3
+			},
+			expected: []Dependency{
+				{IssueID: "bd-1", DependsOnID: "bd-3", Type: "related", CreatedAt: "2024-01-01T00:00:00Z"}, // Only the new one
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := mergeDependencies(tt.left, tt.right)
+			result := mergeDependencies(tt.base, tt.left, tt.right)
 			if len(result) != len(tt.expected) {
 				t.Errorf("mergeDependencies() returned %d deps, want %d", len(result), len(tt.expected))
 				return
@@ -403,7 +444,7 @@ func TestMerge3Way_SimpleUpdates(t *testing.T) {
 		}
 		right := base
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -430,7 +471,7 @@ func TestMerge3Way_SimpleUpdates(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -468,7 +509,7 @@ func TestMerge3Way_SimpleUpdates(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -640,7 +681,7 @@ func TestMerge3Way_AutoResolve(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts with auto-resolution, got %d", len(conflicts))
 		}
@@ -682,7 +723,7 @@ func TestMerge3Way_AutoResolve(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts with auto-resolution, got %d", len(conflicts))
 		}
@@ -724,7 +765,7 @@ func TestMerge3Way_AutoResolve(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts with auto-resolution, got %d", len(conflicts))
 		}
@@ -767,7 +808,7 @@ func TestMerge3Way_AutoResolve(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts with auto-resolution, got %d", len(conflicts))
 		}
@@ -796,7 +837,7 @@ func TestMerge3Way_Deletions(t *testing.T) {
 		left := []Issue{} // Deleted in left
 		right := base     // Unchanged in right
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -818,7 +859,7 @@ func TestMerge3Way_Deletions(t *testing.T) {
 		left := base     // Unchanged in left
 		right := []Issue{} // Deleted in right
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -850,7 +891,7 @@ func TestMerge3Way_Deletions(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts, got %d", len(conflicts))
 		}
@@ -882,7 +923,7 @@ func TestMerge3Way_Deletions(t *testing.T) {
 		}
 		right := []Issue{} // Deleted in right
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts, got %d", len(conflicts))
 		}
@@ -907,7 +948,7 @@ func TestMerge3Way_Additions(t *testing.T) {
 		}
 		right := []Issue{}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -932,7 +973,7 @@ func TestMerge3Way_Additions(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -958,7 +999,7 @@ func TestMerge3Way_Additions(t *testing.T) {
 		left := []Issue{issueData}
 		right := []Issue{issueData}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -990,7 +1031,7 @@ func TestMerge3Way_Additions(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("expected no conflicts with auto-resolution, got %d", len(conflicts))
 		}
@@ -1037,7 +1078,7 @@ func TestMerge3Way_ResurrectionPrevention(t *testing.T) {
 			},
 		}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1091,7 +1132,7 @@ func TestMerge3Way_ResurrectionPrevention(t *testing.T) {
 		// Right: issue is still open (stale)
 		right := base
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1372,7 +1413,7 @@ func TestMerge3Way_TombstoneVsLive(t *testing.T) {
 		left := []Issue{recentTombstone}
 		right := []Issue{modifiedLive}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1389,7 +1430,7 @@ func TestMerge3Way_TombstoneVsLive(t *testing.T) {
 		left := []Issue{modifiedLive}
 		right := []Issue{recentTombstone}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1406,7 +1447,7 @@ func TestMerge3Way_TombstoneVsLive(t *testing.T) {
 		left := []Issue{expiredTombstone}
 		right := []Issue{modifiedLive}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1426,7 +1467,7 @@ func TestMerge3Way_TombstoneVsLive(t *testing.T) {
 		left := []Issue{modifiedLive}
 		right := []Issue{expiredTombstone}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1475,7 +1516,7 @@ func TestMerge3Way_TombstoneVsTombstone(t *testing.T) {
 		left := []Issue{leftTombstone}
 		right := []Issue{rightTombstone}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1504,7 +1545,7 @@ func TestMerge3Way_TombstoneNoBase(t *testing.T) {
 			DeletedBy: "user1",
 		}
 
-		result, conflicts := merge3Way([]Issue{}, []Issue{tombstone}, []Issue{})
+		result, conflicts := merge3Way([]Issue{}, []Issue{tombstone}, []Issue{}, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1527,7 +1568,7 @@ func TestMerge3Way_TombstoneNoBase(t *testing.T) {
 			DeletedBy: "user1",
 		}
 
-		result, conflicts := merge3Way([]Issue{}, []Issue{}, []Issue{tombstone})
+		result, conflicts := merge3Way([]Issue{}, []Issue{}, []Issue{tombstone}, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1557,7 +1598,7 @@ func TestMerge3Way_TombstoneNoBase(t *testing.T) {
 			CreatedBy: "user1",
 		}
 
-		result, conflicts := merge3Way([]Issue{}, []Issue{recentTombstone}, []Issue{live})
+		result, conflicts := merge3Way([]Issue{}, []Issue{recentTombstone}, []Issue{live}, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1607,7 +1648,7 @@ func TestMerge3WayWithTTL(t *testing.T) {
 		left := []Issue{tombstone}
 		right := []Issue{liveIssue}
 
-		result, _ := merge3WayWithTTL(base, left, right, shortTTL)
+		result, _ := Merge3WayWithTTL(base, left, right, shortTTL, false)
 		if len(result) != 1 {
 			t.Fatalf("expected 1 issue, got %d", len(result))
 		}
@@ -1624,7 +1665,7 @@ func TestMerge3WayWithTTL(t *testing.T) {
 		left := []Issue{tombstone}
 		right := []Issue{liveIssue}
 
-		result, _ := merge3WayWithTTL(base, left, right, longTTL)
+		result, _ := Merge3WayWithTTL(base, left, right, longTTL, false)
 		if len(result) != 1 {
 			t.Fatalf("expected 1 issue, got %d", len(result))
 		}
@@ -1712,7 +1753,7 @@ func TestMerge3Way_TombstoneWithImplicitDeletion(t *testing.T) {
 		left := []Issue{tombstone}
 		right := []Issue{} // Implicitly deleted in right
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1732,7 +1773,7 @@ func TestMerge3Way_TombstoneWithImplicitDeletion(t *testing.T) {
 		left := []Issue{} // Implicitly deleted in left
 		right := []Issue{tombstone}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -1756,7 +1797,7 @@ func TestMerge3Way_TombstoneWithImplicitDeletion(t *testing.T) {
 		left := []Issue{modifiedLive}
 		right := []Issue{} // Implicitly deleted in right
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
 		}
@@ -2108,7 +2149,7 @@ func TestMerge3Way_TombstoneBaseBothLiveResurrection(t *testing.T) {
 		left := []Issue{leftLive}
 		right := []Issue{rightLive}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 
 		// Should not have conflicts - merge rules apply
 		if len(conflicts) != 0 {
@@ -2161,7 +2202,7 @@ func TestMerge3Way_TombstoneBaseBothLiveResurrection(t *testing.T) {
 		left := []Issue{leftOpen}
 		right := []Issue{rightOpen}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
@@ -2188,7 +2229,7 @@ func TestMerge3Way_TombstoneBaseBothLiveResurrection(t *testing.T) {
 		left := []Issue{leftOpen}
 		right := []Issue{rightClosed}
 
-		result, conflicts := merge3Way(base, left, right)
+		result, conflicts := merge3Way(base, left, right, false)
 
 		if len(conflicts) != 0 {
 			t.Errorf("unexpected conflicts: %v", conflicts)
@@ -2199,6 +2240,154 @@ func TestMerge3Way_TombstoneBaseBothLiveResurrection(t *testing.T) {
 		// Closed should win over open
 		if result[0].Status != "closed" {
 			t.Errorf("expected closed to win over open, got %q", result[0].Status)
+		}
+	})
+}
+
+// TestMerge3Way_TombstoneVsLiveTimestampPrecisionMismatch tests bd-ncwo:
+// When the same issue has different CreatedAt timestamp precision (e.g., with/without nanoseconds),
+// the tombstone should still win over the live version.
+func TestMerge3Way_TombstoneVsLiveTimestampPrecisionMismatch(t *testing.T) {
+	// This test simulates the ghost resurrection bug where timestamp precision
+	// differences caused the same issue to be treated as two different issues.
+	// The key fix (bd-ncwo) adds ID-based fallback matching when keys don't match.
+
+	t.Run("tombstone wins despite different CreatedAt precision", func(t *testing.T) {
+		// Base: issue with status=closed
+		baseIssue := Issue{
+			ID:        "bd-ghost1",
+			Title:     "Original title",
+			Status:    "closed",
+			Priority:  2,
+			CreatedAt: "2024-01-01T00:00:00Z", // No fractional seconds
+			UpdatedAt: "2024-01-10T00:00:00Z",
+			CreatedBy: "user1",
+		}
+
+		// Left: tombstone with DIFFERENT timestamp precision (has microseconds)
+		tombstone := Issue{
+			ID:           "bd-ghost1",
+			Title:        "(deleted)",
+			Status:       StatusTombstone,
+			Priority:     2,
+			CreatedAt:    "2024-01-01T00:00:00.000000Z", // WITH fractional seconds
+			UpdatedAt:    "2024-01-15T00:00:00Z",
+			CreatedBy:    "user1",
+			DeletedAt:    time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+			DeletedBy:    "user2",
+			DeleteReason: "Duplicate issue",
+		}
+
+		// Right: same closed issue (same precision as base)
+		closedIssue := Issue{
+			ID:        "bd-ghost1",
+			Title:     "Original title",
+			Status:    "closed",
+			Priority:  2,
+			CreatedAt: "2024-01-01T00:00:00Z", // No fractional seconds
+			UpdatedAt: "2024-01-12T00:00:00Z",
+			CreatedBy: "user1",
+		}
+
+		base := []Issue{baseIssue}
+		left := []Issue{tombstone}
+		right := []Issue{closedIssue}
+
+		result, conflicts := merge3Way(base, left, right, false)
+
+		if len(conflicts) != 0 {
+			t.Errorf("unexpected conflicts: %v", conflicts)
+		}
+
+		// CRITICAL: Should have exactly 1 issue, not 2 (no duplicates)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 issue (no duplicates), got %d - this suggests ID-based matching failed", len(result))
+		}
+
+		// Tombstone should win over closed
+		if result[0].Status != StatusTombstone {
+			t.Errorf("expected tombstone to win, got status %q", result[0].Status)
+		}
+		if result[0].DeletedBy != "user2" {
+			t.Errorf("expected tombstone fields preserved, got DeletedBy %q", result[0].DeletedBy)
+		}
+	})
+
+	t.Run("tombstone wins with CreatedBy mismatch", func(t *testing.T) {
+		// Test case where CreatedBy differs (e.g., empty vs populated)
+		tombstone := Issue{
+			ID:           "bd-ghost2",
+			Title:        "(deleted)",
+			Status:       StatusTombstone,
+			Priority:     2,
+			CreatedAt:    "2024-01-01T00:00:00Z",
+			CreatedBy:    "", // Empty CreatedBy
+			DeletedAt:    time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
+			DeletedBy:    "user2",
+			DeleteReason: "Cleanup",
+		}
+
+		closedIssue := Issue{
+			ID:        "bd-ghost2",
+			Title:     "Original title",
+			Status:    "closed",
+			Priority:  2,
+			CreatedAt: "2024-01-01T00:00:00Z",
+			CreatedBy: "user1", // Non-empty CreatedBy
+		}
+
+		base := []Issue{}
+		left := []Issue{tombstone}
+		right := []Issue{closedIssue}
+
+		result, conflicts := merge3Way(base, left, right, false)
+
+		if len(conflicts) != 0 {
+			t.Errorf("unexpected conflicts: %v", conflicts)
+		}
+
+		// Should have exactly 1 issue
+		if len(result) != 1 {
+			t.Fatalf("expected 1 issue (no duplicates), got %d", len(result))
+		}
+
+		// Tombstone should win
+		if result[0].Status != StatusTombstone {
+			t.Errorf("expected tombstone to win despite CreatedBy mismatch, got status %q", result[0].Status)
+		}
+	})
+
+	t.Run("no duplicates when both have same ID but different keys", func(t *testing.T) {
+		// Ensure we don't create duplicate entries
+		liveLeft := Issue{
+			ID:        "bd-ghost3",
+			Title:     "Left version",
+			Status:    "open",
+			CreatedAt: "2024-01-01T00:00:00.123456Z", // With nanoseconds
+			CreatedBy: "user1",
+		}
+
+		liveRight := Issue{
+			ID:        "bd-ghost3",
+			Title:     "Right version",
+			Status:    "in_progress",
+			CreatedAt: "2024-01-01T00:00:00Z", // Without nanoseconds
+			CreatedBy: "user1",
+		}
+
+		base := []Issue{}
+		left := []Issue{liveLeft}
+		right := []Issue{liveRight}
+
+		result, conflicts := merge3Way(base, left, right, false)
+
+		if len(conflicts) != 0 {
+			t.Errorf("unexpected conflicts: %v", conflicts)
+		}
+
+		// CRITICAL: Should have exactly 1 issue, not 2
+		if len(result) != 1 {
+			t.Fatalf("expected 1 issue (no duplicates for same ID), got %d", len(result))
 		}
 	})
 }

@@ -11,11 +11,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
@@ -31,7 +31,7 @@ const RedirectFileName = "redirect"
 // LegacyDatabaseNames are old names that should be migrated
 var LegacyDatabaseNames = []string{"bd.db", "issues.db", "bugs.db"}
 
-// followRedirect checks if a .beads directory contains a redirect file and follows it.
+// FollowRedirect checks if a .beads directory contains a redirect file and follows it.
 // If a redirect file exists, it returns the target .beads directory path.
 // If no redirect exists or there's an error, it returns the original path unchanged.
 //
@@ -41,7 +41,7 @@ var LegacyDatabaseNames = []string{"bd.db", "issues.db", "bugs.db"}
 //
 // Redirect chains are not followed - only one level of redirection is supported.
 // This prevents infinite loops and keeps the behavior predictable.
-func followRedirect(beadsDir string) string {
+func FollowRedirect(beadsDir string) string {
 	redirectFile := filepath.Join(beadsDir, RedirectFileName)
 	data, err := os.ReadFile(redirectFile)
 	if err != nil {
@@ -91,6 +91,81 @@ func followRedirect(beadsDir string) string {
 	}
 
 	return target
+}
+
+// RedirectInfo contains information about a beads directory redirect.
+type RedirectInfo struct {
+	// IsRedirected is true if the local .beads has a redirect file
+	IsRedirected bool
+	// LocalDir is the local .beads directory (the one with the redirect file)
+	LocalDir string
+	// TargetDir is the actual .beads directory being used (after following redirect)
+	TargetDir string
+}
+
+// GetRedirectInfo checks if the current beads directory is redirected.
+// It searches for the local .beads/ directory and checks if it contains a redirect file.
+// Returns RedirectInfo with IsRedirected=true if a redirect is active.
+func GetRedirectInfo() RedirectInfo {
+	info := RedirectInfo{}
+
+	// Find the local .beads directory without following redirects
+	localBeadsDir := findLocalBeadsDir()
+	if localBeadsDir == "" {
+		return info
+	}
+	info.LocalDir = localBeadsDir
+
+	// Check if this directory has a redirect file
+	redirectFile := filepath.Join(localBeadsDir, RedirectFileName)
+	if _, err := os.Stat(redirectFile); err != nil {
+		// No redirect file
+		return info
+	}
+
+	// There's a redirect - find the target
+	targetDir := FollowRedirect(localBeadsDir)
+	if targetDir == localBeadsDir {
+		// Redirect file exists but failed to resolve (invalid target)
+		return info
+	}
+
+	info.IsRedirected = true
+	info.TargetDir = targetDir
+	return info
+}
+
+// findLocalBeadsDir finds the local .beads directory without following redirects.
+// This is used to detect if a redirect is configured.
+func findLocalBeadsDir() string {
+	// Check BEADS_DIR environment variable first
+	if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
+		return utils.CanonicalizePath(beadsDir)
+	}
+
+	// Check for worktree - use main repo's .beads
+	mainRepoRoot, err := git.GetMainRepoRoot()
+	if err == nil && mainRepoRoot != "" {
+		beadsDir := filepath.Join(mainRepoRoot, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return beadsDir
+		}
+	}
+
+	// Walk up directory tree
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	for dir := cwd; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+		beadsDir := filepath.Join(dir, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return beadsDir
+		}
+	}
+
+	return ""
 }
 
 // findDatabaseInBeadsDir searches for a database file within a .beads directory.
@@ -204,25 +279,28 @@ type (
 const (
 	StatusOpen       = types.StatusOpen
 	StatusInProgress = types.StatusInProgress
-	StatusClosed     = types.StatusClosed
 	StatusBlocked    = types.StatusBlocked
+	StatusDeferred   = types.StatusDeferred
+	StatusClosed     = types.StatusClosed
 )
 
 // IssueType constants
 const (
-	TypeBug     = types.TypeBug
-	TypeFeature = types.TypeFeature
-	TypeTask    = types.TypeTask
-	TypeEpic    = types.TypeEpic
-	TypeChore   = types.TypeChore
+	TypeBug      = types.TypeBug
+	TypeFeature  = types.TypeFeature
+	TypeTask     = types.TypeTask
+	TypeEpic     = types.TypeEpic
+	TypeChore    = types.TypeChore
+	TypeMolecule = types.TypeMolecule
 )
 
 // DependencyType constants
 const (
-	DepBlocks         = types.DepBlocks
-	DepRelated        = types.DepRelated
-	DepParentChild    = types.DepParentChild
-	DepDiscoveredFrom = types.DepDiscoveredFrom
+	DepBlocks            = types.DepBlocks
+	DepRelated           = types.DepRelated
+	DepParentChild       = types.DepParentChild
+	DepDiscoveredFrom    = types.DepDiscoveredFrom
+	DepConditionalBlocks = types.DepConditionalBlocks // B runs only if A fails
 )
 
 // SortPolicy constants
@@ -276,7 +354,7 @@ func FindDatabasePath() string {
 		absBeadsDir := utils.CanonicalizePath(beadsDir)
 
 		// Follow redirect if present
-		absBeadsDir = followRedirect(absBeadsDir)
+		absBeadsDir = FollowRedirect(absBeadsDir)
 
 		// Use helper to find database (no warnings for BEADS_DIR - user explicitly set it)
 		if dbPath := findDatabaseInBeadsDir(absBeadsDir, false); dbPath != "" {
@@ -307,7 +385,7 @@ func FindDatabasePath() string {
 // - Any *.db file (excluding backups and vc.db)
 // - Any *.jsonl file (JSONL-only mode or git-tracked issues)
 //
-// Returns false for directories that only contain daemon registry files (bd-420).
+// Returns false for directories that only contain daemon registry files.
 // This prevents FindBeadsDir from returning ~/.beads/ which only has registry.json.
 func hasBeadsProjectFiles(beadsDir string) bool {
 	// Check for project configuration files
@@ -338,10 +416,11 @@ func hasBeadsProjectFiles(beadsDir string) bool {
 
 // FindBeadsDir finds the .beads/ directory in the current directory tree
 // Returns empty string if not found. Supports both database and JSONL-only mode.
-// Stops at the git repository root to avoid finding unrelated directories (bd-c8x).
-// Validates that the directory contains actual project files (bd-420).
+// Stops at the git repository root to avoid finding unrelated directories.
+// Validates that the directory contains actual project files.
 // Redirect files are supported: if a .beads/redirect file exists, its contents
 // are used as the actual .beads directory path.
+// For worktrees, prioritizes the main repository's .beads directory.
 // This is useful for commands that need to detect beads projects without requiring a database.
 func FindBeadsDir() string {
 	// 1. Check BEADS_DIR environment variable (preferred)
@@ -349,38 +428,61 @@ func FindBeadsDir() string {
 		absBeadsDir := utils.CanonicalizePath(beadsDir)
 
 		// Follow redirect if present
-		absBeadsDir = followRedirect(absBeadsDir)
+		absBeadsDir = FollowRedirect(absBeadsDir)
 
 		if info, err := os.Stat(absBeadsDir); err == nil && info.IsDir() {
-			// Validate directory contains actual project files (bd-420)
+			// Validate directory contains actual project files
 			if hasBeadsProjectFiles(absBeadsDir) {
 				return absBeadsDir
 			}
 		}
 	}
 
-	// 2. Search for .beads/ in current directory and ancestors
+	// 2. For worktrees, check main repository root first
+	var mainRepoRoot string
+	if git.IsWorktree() {
+		var err error
+		mainRepoRoot, err = git.GetMainRepoRoot()
+		if err == nil && mainRepoRoot != "" {
+			beadsDir := filepath.Join(mainRepoRoot, ".beads")
+			if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+				// Follow redirect if present
+				beadsDir = FollowRedirect(beadsDir)
+
+				// Validate directory contains actual project files
+				if hasBeadsProjectFiles(beadsDir) {
+					return beadsDir
+				}
+			}
+		}
+	}
+
+	// 3. Search for .beads/ in current directory and ancestors
 	cwd, err := os.Getwd()
 	if err != nil {
 		return ""
 	}
 
-	// Find git root to limit the search (bd-c8x)
+	// Find git root to limit the search
 	gitRoot := findGitRoot()
+	if git.IsWorktree() && mainRepoRoot != "" {
+		// For worktrees, extend search boundary to include main repo
+		gitRoot = mainRepoRoot
+	}
 
 	for dir := cwd; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			// Follow redirect if present
-			beadsDir = followRedirect(beadsDir)
+			beadsDir = FollowRedirect(beadsDir)
 
-			// Validate directory contains actual project files (bd-420)
+			// Validate directory contains actual project files
 			if hasBeadsProjectFiles(beadsDir) {
 				return beadsDir
 			}
 		}
 
-		// Stop at git root to avoid finding unrelated directories (bd-c8x)
+		// Stop at git root to avoid finding unrelated directories
 		if gitRoot != "" && dir == gitRoot {
 			break
 		}
@@ -391,7 +493,7 @@ func FindBeadsDir() string {
 
 // FindJSONLPath returns the expected JSONL file path for the given database path.
 // It searches for existing *.jsonl files in the database directory and returns
-// the first one found, preferring issues.jsonl over beads.jsonl (bd-6xd).
+// the first one found, preferring issues.jsonl over beads.jsonl.
 //
 // This function does not create directories or files - it only discovers paths.
 // Use this when you need to know where bd stores its JSONL export.
@@ -413,18 +515,17 @@ type DatabaseInfo struct {
 
 // findGitRoot returns the root directory of the current git repository,
 // or empty string if not in a git repository. Used to limit directory
-// tree walking to within the current git repo (bd-c8x).
+// tree walking to within the current git repo.
+//
+// This function delegates to git.GetRepoRoot() which is worktree-aware
+// and handles Windows path normalization.
 func findGitRoot() string {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(output))
+	return git.GetRepoRoot()
 }
 
 // findDatabaseInTree walks up the directory tree looking for .beads/*.db
-// Stops at the git repository root to avoid finding unrelated databases (bd-c8x).
+// Stops at the git repository root to avoid finding unrelated databases.
+// For worktrees, searches the main repository root first, then falls back to worktree.
 // Prefers config.json, falls back to beads.db, and warns if multiple .db files exist.
 // Redirect files are supported: if a .beads/redirect file exists, its contents
 // are used as the actual .beads directory path.
@@ -440,15 +541,40 @@ func findDatabaseInTree() string {
 		dir = resolvedDir
 	}
 
-	// Find git root to limit the search (bd-c8x)
-	gitRoot := findGitRoot()
+	// Check if we're in a git worktree
+	var mainRepoRoot string
+	if git.IsWorktree() {
+		// For worktrees, search main repository root first
+		var err error
+		mainRepoRoot, err = git.GetMainRepoRoot()
+		if err == nil && mainRepoRoot != "" {
+			beadsDir := filepath.Join(mainRepoRoot, ".beads")
+			if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+				// Follow redirect if present
+				beadsDir = FollowRedirect(beadsDir)
 
-	// Walk up directory tree
+				// Use helper to find database (with warnings for auto-discovery)
+				if dbPath := findDatabaseInBeadsDir(beadsDir, true); dbPath != "" {
+					return dbPath
+				}
+			}
+		}
+		// If not found in main repo, fall back to worktree search below
+	}
+
+	// Find git root to limit the search
+	gitRoot := findGitRoot()
+	if git.IsWorktree() && mainRepoRoot != "" {
+		// For worktrees, extend search boundary to include main repo
+		gitRoot = mainRepoRoot
+	}
+
+	// Walk up directory tree (regular repository or worktree fallback)
 	for {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			// Follow redirect if present
-			beadsDir = followRedirect(beadsDir)
+			beadsDir = FollowRedirect(beadsDir)
 
 			// Use helper to find database (with warnings for auto-discovery)
 			if dbPath := findDatabaseInBeadsDir(beadsDir, true); dbPath != "" {
@@ -463,7 +589,7 @@ func findDatabaseInTree() string {
 			break
 		}
 
-		// Stop at git root to avoid finding unrelated databases (bd-c8x)
+		// Stop at git root to avoid finding unrelated databases
 		if gitRoot != "" && dir == gitRoot {
 			break
 		}
@@ -474,10 +600,11 @@ func findDatabaseInTree() string {
 	return ""
 }
 
-// FindAllDatabases scans the directory hierarchy for all .beads directories
-// Returns a slice of DatabaseInfo for each database found, starting from the
-// closest to CWD (most relevant) to the furthest (least relevant).
-// Stops at the git repository root to avoid finding unrelated databases (bd-c8x).
+// FindAllDatabases scans the directory hierarchy for the closest .beads directory.
+// Returns a slice with at most one DatabaseInfo - the closest database to CWD.
+// Stops searching upward as soon as a .beads directory is found,
+// because in multi-workspace setups, nested .beads directories
+// are intentional and separate - parent directories are out of scope.
 // Redirect files are supported: if a .beads/redirect file exists, its contents
 // are used as the actual .beads directory path.
 func FindAllDatabases() []DatabaseInfo {
@@ -489,7 +616,7 @@ func FindAllDatabases() []DatabaseInfo {
 		return databases
 	}
 
-	// Find git root to limit the search (bd-c8x)
+	// Find git root to limit the search
 	gitRoot := findGitRoot()
 
 	// Walk up directory tree
@@ -497,7 +624,7 @@ func FindAllDatabases() []DatabaseInfo {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			// Follow redirect if present
-			beadsDir = followRedirect(beadsDir)
+			beadsDir = FollowRedirect(beadsDir)
 
 			// Found .beads/ directory, look for *.db files
 			matches, err := filepath.Glob(filepath.Join(beadsDir, "*.db"))
@@ -540,6 +667,10 @@ func FindAllDatabases() []DatabaseInfo {
 					BeadsDir:   beadsDir,
 					IssueCount: issueCount,
 				})
+
+				// Stop searching upward - the closest .beads is the one to use
+				// Parent directories are out of scope in multi-workspace setups
+				break
 			}
 		}
 
@@ -550,7 +681,7 @@ func FindAllDatabases() []DatabaseInfo {
 			break
 		}
 
-		// Stop at git root to avoid finding unrelated databases (bd-c8x)
+		// Stop at git root to avoid finding unrelated databases
 		if gitRoot != "" && dir == gitRoot {
 			break
 		}

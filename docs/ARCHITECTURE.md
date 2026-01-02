@@ -33,7 +33,7 @@ bd's core design enables a distributed, git-backed issue tracker that feels like
                                v
 ┌─────────────────────────────────────────────────────────────────┐
 │                       JSONL File                                 │
-│                   (.beads/beads.jsonl)                           │
+│                   (.beads/issues.jsonl)                          │
 │                                                                  │
 │  - Git-tracked source of truth                                   │
 │  - One JSON line per entity (issue, dep, label, comment)         │
@@ -241,12 +241,82 @@ open ──▶ in_progress ──▶ closed
          (reopen)
 ```
 
+### JSONL Issue Schema
+
+Each issue in `.beads/issues.jsonl` is a JSON object with the following fields. Fields marked with `(optional)` use `omitempty` and are excluded when empty/zero.
+
+**Core Identification:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier (e.g., `bd-a1b2`) |
+
+**Issue Content:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Issue title (required) |
+| `description` | string | Detailed description (optional) |
+| `design` | string | Design notes (optional) |
+| `acceptance_criteria` | string | Acceptance criteria (optional) |
+| `notes` | string | Additional notes (optional) |
+
+**Status & Workflow:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | Current status: `open`, `in_progress`, `blocked`, `deferred`, `closed`, `tombstone`, `pinned`, `hooked` (optional, defaults to `open`) |
+| `priority` | int | Priority 0-4 where 0=critical, 4=backlog |
+| `issue_type` | string | Type: `bug`, `feature`, `task`, `epic`, `chore`, `message`, `merge-request`, `molecule`, `gate`, `agent`, `role`, `convoy` (optional, defaults to `task`) |
+
+**Assignment:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `assignee` | string | Assigned user/agent (optional) |
+| `estimated_minutes` | int | Time estimate in minutes (optional) |
+
+**Timestamps:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `created_at` | RFC3339 | When issue was created |
+| `created_by` | string | Who created the issue (optional) |
+| `updated_at` | RFC3339 | Last modification time |
+| `closed_at` | RFC3339 | When issue was closed (optional, set when status=closed) |
+| `close_reason` | string | Reason provided when closing (optional) |
+
+**External Integration:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `external_ref` | string | External reference (e.g., `gh-9`, `jira-ABC`) (optional) |
+
+**Relational Data:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `labels` | []string | Tags attached to the issue (optional) |
+| `dependencies` | []Dependency | Relationships to other issues (optional) |
+| `comments` | []Comment | Discussion comments (optional) |
+
+**Tombstone Fields (soft-delete):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `deleted_at` | RFC3339 | When deleted (optional, set when status=tombstone) |
+| `deleted_by` | string | Who deleted (optional) |
+| `delete_reason` | string | Why deleted (optional) |
+| `original_type` | string | Issue type before deletion (optional) |
+
+**Note:** Fields with `json:"-"` tags (like `content_hash`, `source_repo`, `id_prefix`) are internal and never exported to JSONL.
+
 ## Directory Structure
 
 ```
 .beads/
 ├── beads.db          # SQLite database (gitignored)
-├── beads.jsonl       # JSONL source of truth (git-tracked)
+├── issues.jsonl      # JSONL source of truth (git-tracked)
 ├── bd.sock           # Daemon socket (gitignored)
 ├── daemon.log        # Daemon logs (gitignored)
 ├── config.yaml       # Project config (optional)
@@ -265,8 +335,61 @@ open ──▶ in_progress ──▶ closed
 | Import logic | `cmd/bd/import.go`, `internal/importer/` |
 | Auto-sync | `internal/autoimport/`, `internal/flush/` |
 
+## Wisps and Molecules
+
+**Molecules** are template work items that define structured workflows. When spawned, they create **wisps** - ephemeral child issues that track execution steps.
+
+> **For full documentation** on the molecular chemistry metaphor (protos, pour, bond, squash, burn), see [MOLECULES.md](MOLECULES.md).
+
+### Wisp Lifecycle
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   bd mol wisp       │───▶│  Wisp Issues    │───▶│  bd mol squash  │
+│ (from template) │    │  (local-only)   │    │  (→ digest)     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+1. **Create:** Create wisps from a molecule template
+2. **Execute:** Agent works through wisp steps (local SQLite only)
+3. **Squash:** Compress wisps into a permanent digest issue
+
+### Why Wisps Don't Sync
+
+Wisps are intentionally **local-only**:
+
+- They exist only in the spawning agent's SQLite database
+- They are **never exported to JSONL**
+- They cannot resurrect from other clones (they were never there)
+- They are **hard-deleted** when squashed (no tombstones needed)
+
+This design enables:
+
+- **Fast local iteration:** No sync overhead during execution
+- **Clean history:** Only the digest (outcome) enters git
+- **Agent isolation:** Each agent's execution trace is private
+- **Bounded storage:** Wisps don't accumulate across clones
+
+### Wisp vs Regular Issue Deletion
+
+| Aspect | Regular Issues | Wisps |
+|--------|---------------|-------|
+| Exported to JSONL | Yes | No |
+| Tombstone on delete | Yes | No |
+| Can resurrect | Yes (without tombstone) | No (never synced) |
+| Deletion method | `CreateTombstone()` | `DeleteIssue()` (hard delete) |
+
+The `bd mol squash` command uses hard delete intentionally - tombstones would be wasted overhead for data that never leaves the local database.
+
+### Future Directions
+
+- **Separate wisp repo:** Keep wisps in a dedicated ephemeral git repo
+- **Digest migration:** Explicit step to promote digests to main repo
+- **Wisp retention:** Option to preserve wisps in local git history
+
 ## Related Documentation
 
+- [MOLECULES.md](MOLECULES.md) - Molecular chemistry metaphor (protos, pour, bond, squash, burn)
 - [INTERNALS.md](INTERNALS.md) - FlushManager, Blocked Cache implementation details
 - [DAEMON.md](DAEMON.md) - Daemon management and configuration
 - [EXTENDING.md](EXTENDING.md) - Adding custom tables to SQLite

@@ -1,6 +1,6 @@
 # BD Extension Example (Go)
 
-This example demonstrates how to extend bd with custom tables for application-specific orchestration, following the patterns described in [EXTENDING.md](../../EXTENDING.md).
+This example demonstrates how to extend bd with custom tables for application-specific orchestration, following the patterns described in [EXTENDING.md](../../docs/EXTENDING.md).
 
 ## What This Example Shows
 
@@ -59,7 +59,7 @@ GROUP BY i.id, e.id
 
 ### Prerequisites
 
-- Go 1.21 or later
+- Go 1.24 or later
 - bd initialized in a directory (run `bd init --prefix demo`)
 
 ### Install
@@ -238,4 +238,4 @@ See [EXTENDING.md](../../EXTENDING.md) for more patterns and the VC implementati
 
 - [EXTENDING.md](../../EXTENDING.md) - Complete extension guide
 - [../../README.md](../../README.md) - bd documentation
-- Run `bd quickstart` for an interactive tutorial
+- [QUICKSTART.md](../../docs/QUICKSTART.md) - Quick start tutorial
